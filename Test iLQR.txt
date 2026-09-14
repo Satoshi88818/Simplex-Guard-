@@ -1,0 +1,613 @@
+"""
+test_stochastic_ilqr.py
+--------------------------
+Test groups:
+
+  A. GaussianBump / ScalarField: analytic value/gradient/Hessian
+     checked against finite differences (this is the direct validation
+     of "replace finite-difference Jacobians with analytic ones").
+  B. RiskField (product of two fields): same finite-difference
+     validation of the product-rule gradient/Hessian.
+  C. Unicycle dynamics: analytic Jacobians vs finite differences.
+  D. Cost function derivatives (with and without the risk term) vs
+     finite differences.
+  E. iLQR backward/forward pass correctness on tractable cases with
+     known behavior (pure LQR-like reduction, monotonic cost decrease).
+  F. End-to-end stochastic scenarios: risk-averse detour emerges and
+     scales monotonically with risk weight; zero-uncertainty reduces
+     exactly to the risk-free case; a known symmetric-saddle limitation
+     is documented explicitly rather than hidden.
+  G. Adversarial / edge cases: degenerate horizons, zero dt rejection,
+     control clipping, regularization recovery from a contrived
+     ill-conditioned cost.
+"""
+
+import math
+
+import numpy as np
+import pytest
+
+from stochastic_ilqr import (
+    CONTROL_DIM,
+    STATE_DIM,
+    CostConfig,
+    GaussianBump,
+    ILQRSolver,
+    RiskField,
+    ScalarField,
+    unicycle_jacobians,
+    unicycle_step,
+)
+
+
+def finite_diff_gradient(f, p, eps=1e-6):
+    grad = np.zeros_like(p, dtype=np.float64)
+    for i in range(len(p)):
+        pp = p.copy()
+        pm = p.copy()
+        pp[i] += eps
+        pm[i] -= eps
+        grad[i] = (f(pp) - f(pm)) / (2 * eps)
+    return grad
+
+
+def finite_diff_hessian(f, p, eps=1e-4):
+    n = len(p)
+    H = np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            pp = p.copy(); pp[i] += eps; pp[j] += eps
+            pm = p.copy(); pm[i] += eps; pm[j] -= eps
+            mp = p.copy(); mp[i] -= eps; mp[j] += eps
+            mm = p.copy(); mm[i] -= eps; mm[j] -= eps
+            H[i, j] = (f(pp) - f(pm) - f(mp) + f(mm)) / (4 * eps ** 2)
+    return H
+
+
+def finite_diff_jacobian(f, x, eps=1e-6):
+    """f: R^n -> R^m, returns m x n Jacobian via central differences."""
+    y0 = f(x)
+    m, n = len(y0), len(x)
+    J = np.zeros((m, n))
+    for j in range(n):
+        xp = x.copy(); xp[j] += eps
+        xm = x.copy(); xm[j] -= eps
+        J[:, j] = (f(xp) - f(xm)) / (2 * eps)
+    return J
+
+
+# ==========================================================================
+# A. GaussianBump / ScalarField
+# ==========================================================================
+
+
+class TestGaussianBump:
+    @pytest.mark.parametrize("seed", range(10))
+    def test_gradient_matches_finite_difference(self, seed):
+        rng = np.random.default_rng(seed)
+        bump = GaussianBump(center=tuple(rng.uniform(-5, 5, 2)), amplitude=rng.uniform(0.5, 2.0), sigma=rng.uniform(0.5, 3.0))
+        p = rng.uniform(-8, 8, 2)
+        analytic = bump.gradient(p)
+        numeric = finite_diff_gradient(bump.value, p)
+        np.testing.assert_allclose(analytic, numeric, atol=1e-5)
+
+    @pytest.mark.parametrize("seed", range(10))
+    def test_hessian_matches_finite_difference(self, seed):
+        rng = np.random.default_rng(seed)
+        bump = GaussianBump(center=tuple(rng.uniform(-5, 5, 2)), amplitude=rng.uniform(0.5, 2.0), sigma=rng.uniform(0.5, 3.0))
+        p = rng.uniform(-8, 8, 2)
+        analytic = bump.hessian(p)
+        numeric = finite_diff_hessian(bump.value, p)
+        np.testing.assert_allclose(analytic, numeric, atol=1e-3)
+
+    def test_hessian_is_symmetric(self):
+        bump = GaussianBump(center=(1.0, 2.0), amplitude=1.5, sigma=1.0)
+        H = bump.hessian(np.array([0.5, 0.5]))
+        np.testing.assert_allclose(H, H.T)
+
+    def test_rejects_nonpositive_sigma(self):
+        with pytest.raises(ValueError):
+            GaussianBump(center=(0, 0), amplitude=1.0, sigma=0.0)
+        with pytest.raises(ValueError):
+            GaussianBump(center=(0, 0), amplitude=1.0, sigma=-1.0)
+
+    def test_value_decays_to_zero_far_from_center(self):
+        bump = GaussianBump(center=(0, 0), amplitude=1.0, sigma=1.0)
+        assert bump.value(np.array([100.0, 100.0])) < 1e-10
+
+    def test_value_at_center_equals_amplitude(self):
+        bump = GaussianBump(center=(3.0, -2.0), amplitude=0.7, sigma=1.0)
+        assert bump.value(np.array([3.0, -2.0])) == pytest.approx(0.7)
+
+
+class TestScalarField:
+    def test_empty_field_is_zero_everywhere(self):
+        field = ScalarField([])
+        p = np.array([1.0, 2.0])
+        assert field.value(p) == 0.0
+        np.testing.assert_array_equal(field.gradient(p), np.zeros(2))
+        np.testing.assert_array_equal(field.hessian(p), np.zeros((2, 2)))
+
+    def test_sum_of_bumps_matches_manual_sum(self):
+        b1 = GaussianBump((0, 0), 1.0, 1.0)
+        b2 = GaussianBump((3, 3), 0.5, 2.0)
+        field = ScalarField([b1, b2])
+        p = np.array([1.0, 1.0])
+        assert field.value(p) == pytest.approx(b1.value(p) + b2.value(p))
+
+    @pytest.mark.parametrize("seed", range(5))
+    def test_multi_bump_gradient_matches_finite_difference(self, seed):
+        rng = np.random.default_rng(seed)
+        bumps = [
+            GaussianBump(tuple(rng.uniform(-4, 4, 2)), rng.uniform(0.3, 1.5), rng.uniform(0.5, 2.0))
+            for _ in range(3)
+        ]
+        field = ScalarField(bumps)
+        p = rng.uniform(-6, 6, 2)
+        analytic = field.gradient(p)
+        numeric = finite_diff_gradient(field.value, p)
+        np.testing.assert_allclose(analytic, numeric, atol=1e-5)
+
+
+# ==========================================================================
+# B. RiskField (product of two fields)
+# ==========================================================================
+
+
+class TestRiskField:
+    @pytest.mark.parametrize("seed", range(10))
+    def test_gradient_matches_finite_difference(self, seed):
+        rng = np.random.default_rng(seed)
+        unc = ScalarField([GaussianBump(tuple(rng.uniform(-4, 4, 2)), rng.uniform(0.3, 1.0), rng.uniform(0.5, 2.0))])
+        occ = ScalarField([GaussianBump(tuple(rng.uniform(-4, 4, 2)), rng.uniform(0.3, 1.0), rng.uniform(0.5, 2.0))])
+        risk = RiskField(unc, occ)
+        p = rng.uniform(-6, 6, 2)
+        analytic = risk.gradient(p)
+        numeric = finite_diff_gradient(risk.value, p)
+        np.testing.assert_allclose(analytic, numeric, atol=1e-5)
+
+    @pytest.mark.parametrize("seed", range(10))
+    def test_hessian_matches_finite_difference(self, seed):
+        rng = np.random.default_rng(seed)
+        unc = ScalarField([GaussianBump(tuple(rng.uniform(-4, 4, 2)), rng.uniform(0.3, 1.0), rng.uniform(0.5, 2.0))])
+        occ = ScalarField([GaussianBump(tuple(rng.uniform(-4, 4, 2)), rng.uniform(0.3, 1.0), rng.uniform(0.5, 2.0))])
+        risk = RiskField(unc, occ)
+        p = rng.uniform(-6, 6, 2)
+        analytic = risk.hessian(p)
+        numeric = finite_diff_hessian(risk.value, p)
+        np.testing.assert_allclose(analytic, numeric, atol=1e-3)
+
+    def test_zero_uncertainty_gives_zero_risk_everywhere(self):
+        unc = ScalarField([])  # no uncertainty anywhere
+        occ = ScalarField([GaussianBump((0, 0), 1.0, 1.0)])
+        risk = RiskField(unc, occ)
+        for p in [np.array([0.0, 0.0]), np.array([1.0, 1.0]), np.array([-3.0, 2.0])]:
+            assert risk.value(p) == 0.0
+            np.testing.assert_array_equal(risk.gradient(p), np.zeros(2))
+
+    def test_zero_occupancy_gives_zero_risk_everywhere(self):
+        unc = ScalarField([GaussianBump((0, 0), 1.0, 1.0)])
+        occ = ScalarField([])
+        risk = RiskField(unc, occ)
+        p = np.array([0.5, 0.5])
+        assert risk.value(p) == 0.0
+
+    def test_risk_hessian_is_symmetric(self):
+        unc = ScalarField([GaussianBump((1, 1), 1.0, 1.0)])
+        occ = ScalarField([GaussianBump((1.5, 0.5), 0.8, 1.2)])
+        risk = RiskField(unc, occ)
+        H = risk.hessian(np.array([1.0, 0.5]))
+        np.testing.assert_allclose(H, H.T)
+
+
+# ==========================================================================
+# C. Unicycle dynamics
+# ==========================================================================
+
+
+class TestUnicycleDynamics:
+    def test_straight_line_motion(self):
+        x = np.array([0.0, 0.0, 0.0])
+        u = np.array([2.0, 0.0])
+        x2 = unicycle_step(x, u, dt=1.0)
+        np.testing.assert_allclose(x2, [2.0, 0.0, 0.0])
+
+    def test_pure_rotation_in_place(self):
+        x = np.array([1.0, 1.0, 0.0])
+        u = np.array([0.0, 0.5])
+        x2 = unicycle_step(x, u, dt=2.0)
+        np.testing.assert_allclose(x2, [1.0, 1.0, 1.0])
+
+    @pytest.mark.parametrize("seed", range(15))
+    def test_jacobian_A_matches_finite_difference(self, seed):
+        rng = np.random.default_rng(seed)
+        x = np.array([rng.uniform(-5, 5), rng.uniform(-5, 5), rng.uniform(-math.pi, math.pi)])
+        u = np.array([rng.uniform(-3, 3), rng.uniform(-1, 1)])
+        dt = 0.1
+        A, _ = unicycle_jacobians(x, u, dt)
+        A_numeric = finite_diff_jacobian(lambda xx: unicycle_step(xx, u, dt), x)
+        np.testing.assert_allclose(A, A_numeric, atol=1e-5)
+
+    @pytest.mark.parametrize("seed", range(15))
+    def test_jacobian_B_matches_finite_difference(self, seed):
+        rng = np.random.default_rng(seed)
+        x = np.array([rng.uniform(-5, 5), rng.uniform(-5, 5), rng.uniform(-math.pi, math.pi)])
+        u = np.array([rng.uniform(-3, 3), rng.uniform(-1, 1)])
+        dt = 0.1
+        _, B = unicycle_jacobians(x, u, dt)
+        B_numeric = finite_diff_jacobian(lambda uu: unicycle_step(x, uu, dt), u)
+        np.testing.assert_allclose(B, B_numeric, atol=1e-5)
+
+
+# ==========================================================================
+# D. Cost function derivatives
+# ==========================================================================
+
+
+class TestCostDerivatives:
+    def _make_cost(self, risk_weight=0.0, risk_field=None):
+        return CostConfig(
+            Q_running=np.diag([0.1, 0.1, 0.01]),
+            R=np.diag([0.2, 0.3]),
+            Qf=np.diag([5.0, 5.0, 1.0]),
+            goal=np.array([3.0, 1.0, 0.2]),
+            risk_weight=risk_weight,
+            risk_field=risk_field,
+        )
+
+    @pytest.mark.parametrize("seed", range(10))
+    def test_stage_cost_lx_matches_finite_difference_no_risk(self, seed):
+        rng = np.random.default_rng(seed)
+        cost = self._make_cost()
+        x = rng.uniform(-3, 3, 3)
+        u = rng.uniform(-2, 2, 2)
+        l_x, _, _, _, _ = cost.stage_derivatives(x, u)
+        numeric = finite_diff_gradient(lambda xx: cost.stage_cost(xx, u), x)
+        np.testing.assert_allclose(l_x, numeric, atol=1e-4)
+
+    @pytest.mark.parametrize("seed", range(10))
+    def test_stage_cost_lu_matches_finite_difference(self, seed):
+        rng = np.random.default_rng(seed)
+        cost = self._make_cost()
+        x = rng.uniform(-3, 3, 3)
+        u = rng.uniform(-2, 2, 2)
+        _, l_u, _, _, _ = cost.stage_derivatives(x, u)
+        numeric = finite_diff_gradient(lambda uu: cost.stage_cost(x, uu), u)
+        np.testing.assert_allclose(l_u, numeric, atol=1e-4)
+
+    @pytest.mark.parametrize("seed", range(8))
+    def test_stage_cost_lxx_matches_finite_difference_no_risk(self, seed):
+        rng = np.random.default_rng(seed)
+        cost = self._make_cost()
+        x = rng.uniform(-3, 3, 3)
+        u = rng.uniform(-2, 2, 2)
+        _, _, l_xx, _, _ = cost.stage_derivatives(x, u)
+        numeric = finite_diff_hessian(lambda xx: cost.stage_cost(xx, u), x)
+        np.testing.assert_allclose(l_xx, numeric, atol=1e-3)
+
+    def test_stage_cost_lxx_with_risk_term_matches_finite_difference(self):
+        unc = ScalarField([GaussianBump((1.0, 0.5), 1.0, 1.2)])
+        occ = ScalarField([GaussianBump((1.2, 0.3), 0.7, 1.0)])
+        risk = RiskField(unc, occ)
+        cost = self._make_cost(risk_weight=25.0, risk_field=risk)
+        x = np.array([0.8, 0.4, 0.1])
+        u = np.array([1.0, -0.3])
+        _, _, l_xx, _, _ = cost.stage_derivatives(x, u)
+        numeric = finite_diff_hessian(lambda xx: cost.stage_cost(xx, u), x)
+        np.testing.assert_allclose(l_xx, numeric, atol=1e-2)
+
+    def test_risk_term_contributes_only_to_position_block(self):
+        unc = ScalarField([GaussianBump((0, 0), 1.0, 1.0)])
+        occ = ScalarField([GaussianBump((0, 0), 1.0, 1.0)])
+        risk = RiskField(unc, occ)
+        cost = self._make_cost(risk_weight=10.0, risk_field=risk)
+        x = np.array([0.5, 0.5, 0.3])
+        u = np.array([1.0, 0.5])
+        l_x, l_u, l_xx, l_uu, l_ux = cost.stage_derivatives(x, u)
+        # heading row/col of l_xx unaffected by risk (only x,y coupled)
+        cost_no_risk = self._make_cost()
+        l_x0, _, l_xx0, _, _ = cost_no_risk.stage_derivatives(x, u)
+        assert l_x[2] == pytest.approx(l_x0[2])
+        np.testing.assert_allclose(l_xx[2, :], l_xx0[2, :])
+        np.testing.assert_allclose(l_xx[:, 2], l_xx0[:, 2])
+        # l_u, l_uu, l_ux entirely unaffected by a position-only risk term
+        l_u0, _, l_uu0, l_ux0 = (
+            cost_no_risk.stage_derivatives(x, u)[1],
+            None,
+            cost_no_risk.stage_derivatives(x, u)[3],
+            cost_no_risk.stage_derivatives(x, u)[4],
+        )
+        np.testing.assert_allclose(l_u, l_u0)
+        np.testing.assert_allclose(l_uu, l_uu0)
+        np.testing.assert_allclose(l_ux, l_ux0)
+
+    def test_terminal_derivatives_match_finite_difference(self):
+        cost = self._make_cost()
+        x = np.array([2.0, -1.0, 0.4])
+        lf_x, lf_xx = cost.terminal_derivatives(x)
+        numeric_grad = finite_diff_gradient(cost.terminal_cost, x)
+        numeric_hess = finite_diff_hessian(cost.terminal_cost, x)
+        np.testing.assert_allclose(lf_x, numeric_grad, atol=1e-4)
+        np.testing.assert_allclose(lf_xx, numeric_hess, atol=1e-3)
+
+
+# ==========================================================================
+# E. iLQR core behavior
+# ==========================================================================
+
+
+def straight_line_cost(goal, risk_weight=0.0, risk_field=None, q_running=None):
+    return CostConfig(
+        Q_running=np.zeros((3, 3)) if q_running is None else q_running,
+        R=np.diag([0.05, 0.05]),
+        Qf=np.diag([20.0, 20.0, 5.0]),
+        goal=goal,
+        risk_weight=risk_weight,
+        risk_field=risk_field,
+    )
+
+
+class TestILQRCoreBehavior:
+    def test_reaches_goal_with_no_obstacles(self):
+        cost = straight_line_cost(goal=np.array([5.0, 0.0, 0.0]))
+        solver = ILQRSolver(cost, dt=0.1, max_iters=100)
+        T = 30
+        result = solver.solve(np.zeros(3), np.zeros((T, 2)))
+        assert result.converged
+        assert np.linalg.norm(result.X[-1, :2] - np.array([5.0, 0.0])) < 0.5
+
+    def test_cost_is_monotonically_non_increasing_across_accepted_iterations(self):
+        cost = straight_line_cost(goal=np.array([5.0, 2.0, 0.0]))
+        solver = ILQRSolver(cost, dt=0.1, max_iters=100)
+        T = 40
+        result = solver.solve(np.zeros(3), np.zeros((T, 2)))
+        history = result.cost_history
+        assert all(c2 <= c1 + 1e-9 for c1, c2 in zip(history, history[1:]))
+
+    def test_lateral_goal_requires_nonzero_turning(self):
+        cost = straight_line_cost(goal=np.array([5.0, 5.0, math.pi / 4]))
+        solver = ILQRSolver(cost, dt=0.1, max_iters=150)
+        T = 50
+        result = solver.solve(np.zeros(3), np.zeros((T, 2)))
+        assert result.converged
+        assert np.linalg.norm(result.X[-1, :2] - np.array([5.0, 5.0])) < 0.6
+
+    def test_higher_control_cost_reduces_control_effort(self):
+        goal = np.array([5.0, 0.0, 0.0])
+        T = 30
+        cheap = straight_line_cost(goal, q_running=np.zeros((3, 3)))
+        cheap.R = np.diag([0.01, 0.01])
+        expensive = straight_line_cost(goal, q_running=np.zeros((3, 3)))
+        expensive.R = np.diag([5.0, 5.0])
+
+        result_cheap = ILQRSolver(cheap, dt=0.1, max_iters=100).solve(np.zeros(3), np.zeros((T, 2)))
+        result_expensive = ILQRSolver(expensive, dt=0.1, max_iters=100).solve(np.zeros(3), np.zeros((T, 2)))
+
+        effort_cheap = np.sum(result_cheap.U ** 2)
+        effort_expensive = np.sum(result_expensive.U ** 2)
+        assert effort_expensive < effort_cheap
+
+
+# ==========================================================================
+# F. End-to-end stochastic (risk-averse) scenarios
+# ==========================================================================
+
+
+OBSTACLE_CENTER = (5.0, 0.0)
+
+
+def make_risk_field(unc_amp=1.0, occ_amp=0.8, sigma=1.5, center=OBSTACLE_CENTER):
+    unc = ScalarField([GaussianBump(center=center, amplitude=unc_amp, sigma=sigma)])
+    occ = ScalarField([GaussianBump(center=center, amplitude=occ_amp, sigma=sigma)])
+    return RiskField(unc, occ)
+
+
+def run_detour_scenario(risk_weight, symmetry_breaking_nudge=0.15, T=60, dt=0.1, max_iters=300):
+    risk_field = make_risk_field()
+    goal = np.array([10.0, 0.0, 0.0])
+    cost = CostConfig(
+        Q_running=np.zeros((3, 3)),
+        R=np.diag([0.05, 0.05]),
+        Qf=np.diag([20.0, 20.0, 5.0]),
+        goal=goal,
+        risk_weight=risk_weight,
+        risk_field=risk_field,
+    )
+    solver = ILQRSolver(cost, dt=dt, max_iters=max_iters, cost_tol=1e-4)
+    U_init = np.tile(np.array([2.0, 0.0]), (T, 1))
+    if symmetry_breaking_nudge:
+        U_init[5, 1] = symmetry_breaking_nudge
+    return solver.solve(np.zeros(3), U_init)
+
+
+class TestStochasticRiskAvoidance:
+    def test_risk_averse_trajectory_detours_around_uncertain_occupied_region(self):
+        no_risk = run_detour_scenario(risk_weight=0.0)
+        with_risk = run_detour_scenario(risk_weight=500.0)
+
+        center = np.array(OBSTACLE_CENTER)
+        min_dist_no_risk = np.linalg.norm(no_risk.X[:, :2] - center, axis=1).min()
+        min_dist_with_risk = np.linalg.norm(with_risk.X[:, :2] - center, axis=1).min()
+
+        assert min_dist_no_risk < 0.5  # risk-blind planner cuts right through
+        assert min_dist_with_risk > 3.0  # risk-aware planner detours well clear
+        assert with_risk.converged
+        assert no_risk.converged
+        # Both must still reach the goal -- risk-awareness must not
+        # come at the cost of abandoning the task.
+        assert np.linalg.norm(with_risk.X[-1, :2] - np.array([10.0, 0.0])) < 1.0
+        assert np.linalg.norm(no_risk.X[-1, :2] - np.array([10.0, 0.0])) < 1.0
+
+    @pytest.mark.parametrize(
+        "w1,w2", [(0.0, 20.0), (20.0, 100.0), (100.0, 500.0), (500.0, 2000.0)]
+    )
+    def test_detour_distance_is_monotonic_in_risk_weight(self, w1, w2):
+        """Increasing the risk weight must never make the planner cut
+        CLOSER to a fixed uncertain/occupied region -- more caution
+        should never buy less clearance.
+        """
+        result1 = run_detour_scenario(risk_weight=w1)
+        result2 = run_detour_scenario(risk_weight=w2)
+        center = np.array(OBSTACLE_CENTER)
+        d1 = np.linalg.norm(result1.X[:, :2] - center, axis=1).min()
+        d2 = np.linalg.norm(result2.X[:, :2] - center, axis=1).min()
+        assert d2 >= d1 - 1e-6
+
+    def test_zero_uncertainty_makes_risk_weight_irrelevant(self):
+        """If the uncertainty field is zero everywhere, the risk term
+        (uncertainty x occupancy) is identically zero no matter how
+        high occupancy is or how large risk_weight is -- confirming
+        the product-rule design actually behaves as documented, not
+        just at a single point (checked above in TestRiskField) but
+        through a full trajectory optimization.
+        """
+        zero_uncertainty = ScalarField([])
+        high_occupancy = ScalarField([GaussianBump(OBSTACLE_CENTER, 1.0, 1.5)])
+        risk_field = RiskField(zero_uncertainty, high_occupancy)
+        goal = np.array([10.0, 0.0, 0.0])
+        cost_huge_weight = CostConfig(
+            Q_running=np.zeros((3, 3)), R=np.diag([0.05, 0.05]), Qf=np.diag([20.0, 20.0, 5.0]),
+            goal=goal, risk_weight=1e6, risk_field=risk_field,
+        )
+        cost_no_risk = CostConfig(
+            Q_running=np.zeros((3, 3)), R=np.diag([0.05, 0.05]), Qf=np.diag([20.0, 20.0, 5.0]),
+            goal=goal, risk_weight=0.0, risk_field=None,
+        )
+        T = 60
+        U_init = np.tile(np.array([2.0, 0.0]), (T, 1))
+        r1 = ILQRSolver(cost_huge_weight, dt=0.1, max_iters=100).solve(np.zeros(3), U_init.copy())
+        r2 = ILQRSolver(cost_no_risk, dt=0.1, max_iters=100).solve(np.zeros(3), U_init.copy())
+        np.testing.assert_allclose(r1.X, r2.X, atol=1e-6)
+        np.testing.assert_allclose(r1.U, r2.U, atol=1e-6)
+
+    def test_KNOWN_LIMITATION_symmetric_obstacle_on_straight_path_is_a_local_saddle(self):
+        """This documents a genuine, understood limitation of LOCAL
+        trajectory optimization (not a bug specific to this
+        implementation): when the risky region is placed exactly on
+        the straight line between start and goal, going left or right
+        costs exactly the same, so the lateral gradient of the total
+        cost at y=0 is exactly zero everywhere along a straight-line
+        reference trajectory. iLQR (like any local, gradient-based
+        method) has no basis to break that tie on its own -- it needs
+        a symmetry-breaking nudge in the initial guess (a real system
+        would get this "for free" from a warm-start off a previous,
+        already-asymmetric plan, or from a sampling-based global
+        proposal upstream of the local optimizer).
+
+        We verify the failure mode concretely (a perfectly symmetric
+        initial guess does NOT detour) and that a small, one-time
+        symmetry-breaking nudge resolves it (already relied on by
+        every other test in this section) -- rather than silently
+        always including the nudge and never surfacing that it was
+        needed.
+        """
+        result_symmetric = run_detour_scenario(risk_weight=500.0, symmetry_breaking_nudge=0.0)
+        center = np.array(OBSTACLE_CENTER)
+        min_dist = np.linalg.norm(result_symmetric.X[:, :2] - center, axis=1).min()
+        assert min_dist < 0.5, (
+            "expected the symmetric initial guess to remain stuck on the "
+            "straight-line saddle; if this now detours on its own, the "
+            "solver's symmetry-breaking behavior has changed and this "
+            "test (and the write-up's limitations section) should be "
+            "revisited"
+        )
+
+        result_nudged = run_detour_scenario(risk_weight=500.0, symmetry_breaking_nudge=0.15)
+        min_dist_nudged = np.linalg.norm(result_nudged.X[:, :2] - center, axis=1).min()
+        assert min_dist_nudged > 3.0
+
+
+# ==========================================================================
+# G. Adversarial / edge cases
+# ==========================================================================
+
+
+class TestAdversarialAndEdgeCases:
+    def test_zero_dt_raises_or_is_rejected_gracefully(self):
+        cost = straight_line_cost(goal=np.array([1.0, 0.0, 0.0]))
+        # dt=0 makes every control ineffective (A=I, B=0): the solver
+        # must not crash, and must simply fail to reach the goal
+        # (not silently report success).
+        solver = ILQRSolver(cost, dt=0.0, max_iters=20)
+        result = solver.solve(np.zeros(3), np.zeros((10, 2)))
+        assert np.linalg.norm(result.X[-1, :2] - np.array([1.0, 0.0])) > 0.5
+
+    def test_single_step_horizon_does_not_crash(self):
+        cost = straight_line_cost(goal=np.array([0.5, 0.0, 0.0]))
+        solver = ILQRSolver(cost, dt=0.1, max_iters=20)
+        result = solver.solve(np.zeros(3), np.zeros((1, 2)))
+        assert result.X.shape == (2, 3)
+        assert result.U.shape == (1, 2)
+
+    def test_control_clipping_is_respected(self):
+        cost = straight_line_cost(goal=np.array([50.0, 0.0, 0.0]))  # far goal, wants max speed
+        max_control = np.array([1.0, 1.0])
+        solver = ILQRSolver(cost, dt=0.1, max_iters=100, max_control=max_control)
+        result = solver.solve(np.zeros(3), np.zeros((60, 2)))
+        assert np.all(np.abs(result.U) <= max_control + 1e-9)
+
+    def test_ill_conditioned_terminal_cost_triggers_regularization_not_crash(self):
+        """A terminal cost with a huge condition number can make Q_uu
+        (backward-pass) numerically fragile. The regularization scheme
+        must recover (increase reg, retry) rather than raising or
+        returning NaNs.
+        """
+        cost = CostConfig(
+            Q_running=np.zeros((3, 3)),
+            R=np.diag([1e-8, 1e-8]),  # tiny control cost -> aggressive Q_uu
+            Qf=np.diag([1e6, 1e6, 1e6]),  # huge terminal cost
+            goal=np.array([3.0, 0.0, 0.0]),
+        )
+        solver = ILQRSolver(cost, dt=0.1, max_iters=50)
+        result = solver.solve(np.zeros(3), np.zeros((20, 2)))
+        assert np.all(np.isfinite(result.X))
+        assert np.all(np.isfinite(result.U))
+
+    def test_goal_equals_start_converges_trivially(self):
+        cost = straight_line_cost(goal=np.zeros(3))
+        solver = ILQRSolver(cost, dt=0.1, max_iters=50)
+        result = solver.solve(np.zeros(3), np.zeros((10, 2)))
+        assert result.converged
+        np.testing.assert_allclose(result.U, np.zeros((10, 2)), atol=1e-6)
+
+    def test_result_never_contains_nan_or_inf_across_random_scenarios(self):
+        rng = np.random.default_rng(0)
+        for _ in range(10):
+            goal = np.array([rng.uniform(-10, 10), rng.uniform(-10, 10), rng.uniform(-math.pi, math.pi)])
+            cost = straight_line_cost(goal=goal)
+            solver = ILQRSolver(cost, dt=0.1, max_iters=80)
+            T = int(rng.integers(5, 60))
+            U_init = rng.normal(0, 0.1, size=(T, 2))
+            result = solver.solve(np.zeros(3), U_init)
+            assert np.all(np.isfinite(result.X))
+            assert np.all(np.isfinite(result.U))
+
+    def test_reg_max_exceeded_returns_gracefully_not_infinite_loop(self):
+        """Construct a pathological cost (negative-definite-ish via a
+        deliberately broken R) and confirm the solver terminates
+        (returns a result, converged=False is acceptable) rather than
+        looping forever if regularization can never stabilize it.
+        """
+        cost = straight_line_cost(goal=np.array([1.0, 0.0, 0.0]))
+        cost.R = np.diag([-1.0, -1.0])  # invalid control cost, deliberately broken
+        solver = ILQRSolver(cost, dt=0.1, max_iters=30, reg_max=1e4)
+        result = solver.solve(np.zeros(3), np.zeros((10, 2)))
+        # Must return SOMETHING finite-shaped; convergence is not
+        # guaranteed or required for a deliberately ill-posed cost.
+        assert result.X.shape == (11, 3)
+
+    def test_backward_pass_never_stabilizing_returns_immediately_not_stuck(self):
+        """Even lower reg_max than the pathological-cost test above,
+        to specifically exercise the early-return path inside the
+        main solve loop's regularization-growth while-loop (distinct
+        from the post-forward-pass regularization-growth path already
+        covered above): the backward pass itself must never succeed
+        for this cost/reg_max combination, so solve() must return
+        promptly via that early-return rather than hang.
+        """
+        cost = straight_line_cost(goal=np.array([1.0, 0.0, 0.0]))
+        cost.R = np.diag([-1.0, -1.0])
+        solver = ILQRSolver(cost, dt=0.1, max_iters=5, reg_init=1e-3, reg_max=1e-2, reg_factor=2.0)
+        result = solver.solve(np.zeros(3), np.zeros((5, 2)))
+        assert not result.converged
+        assert result.X.shape == (6, 3)
