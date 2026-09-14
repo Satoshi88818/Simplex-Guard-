@@ -1,0 +1,434 @@
+"""
+closed_loop_sim.py
+--------------------
+A small, fully-synthetic closed-loop simulator used to stress-test the
+Simplex Guard (see simplex_guard.py) across a *sequence* of decisions
+over time, not just isolated snapshots. This exists to catch a class
+of bugs unit tests structurally cannot: oscillating overrides,
+fallback trajectories that are too gentle once actually integrated
+forward, or behavior that only breaks after several cycles of
+feedback between the guard's output and the world's response to it.
+
+No real driving data is used anywhere in this file. Every vehicle,
+obstacle, and scenario is a scripted, hand-specified kinematic model.
+
+Scope and honesty about limitations
+------------------------------------
+This is a toy simulator, not a validation platform:
+  - Kinematics are a simple unicycle-style model integrated with
+    explicit (forward) Euler steps, not a validated vehicle dynamics
+    model.
+  - One "sim tick" == one guard planning cycle (no separate high-rate
+    reactive loop as in the full FSD v12 design doc's async
+    architecture) -- this keeps the harness simple to audit at the
+    cost of not testing the multi-rate execution boundary.
+  - Collision checking is longitudinal-only (single-lane car-following
+    geometry): fine for the scenarios below, not a general 2D
+    collision model.
+  - The Simplex Guard itself is stateless per call, by design (see
+    simplex_guard.py docstring). This simulator deliberately includes
+    a scenario that surfaces the real consequence of that
+    statelessness under sensor dropout, rather than hiding it.
+
+Coordinate conventions
+-----------------------
+World frame: fixed at simulation start, ego begins at the origin with
+heading 0 (facing +x). Actors (lead vehicles / obstacles) move along
+the same +x axis at a fixed lateral offset y (0.0 for same-lane).
+
+Ego-frame occupancy grids passed to the guard follow the exact same
+convention as simplex_guard.py's `nearest_obstacle_distance_ahead`:
+ego at (origin_row, origin_col), +x forward = +col, +y left = -row.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from typing import Callable, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+from simplex_guard import (
+    FallbackMode,
+    GuardDecision,
+    SimplexGuard,
+    SimplexGuardConfig,
+    ViolationType,
+)
+
+# --------------------------------------------------------------------------
+# Kinematics
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class VehicleState:
+    x: float
+    y: float = 0.0
+    heading: float = 0.0
+    speed: float = 0.0
+
+
+def step_kinematics(
+    state: VehicleState, accel: float, curvature: float, dt: float
+) -> VehicleState:
+    """Explicit-Euler unicycle-style kinematic update.
+
+        heading_dot = speed * curvature
+        x_dot       = speed * cos(heading)
+        y_dot       = speed * sin(heading)
+        speed_dot   = accel
+
+    This is intentionally simple (not RK4, not a bicycle model with
+    slip) -- it is sufficient to expose feedback/timing bugs in the
+    guard's decision loop, which is what this harness is for. It is
+    NOT a substitute for a validated vehicle dynamics simulator.
+    """
+    new_x = state.x + state.speed * math.cos(state.heading) * dt
+    new_y = state.y + state.speed * math.sin(state.heading) * dt
+    new_heading = state.heading + state.speed * curvature * dt
+    new_speed = max(state.speed + accel * dt, 0.0)
+    return VehicleState(new_x, new_y, new_heading, new_speed)
+
+
+# --------------------------------------------------------------------------
+# Scripted actors (lead vehicles / static obstacles)
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class AccelSegment:
+    """An acceleration held constant from `t_start_s` (measured relative
+    to the actor's own spawn time) until the next segment's start."""
+
+    t_start_s: float
+    accel_mps2: float
+
+
+@dataclass
+class ScriptedActor:
+    """A longitudinally-moving actor (lead vehicle or static obstacle)
+    with a scripted acceleration profile, and a spawn time that lets a
+    single mechanism represent both "present from the start" (spawn at
+    t=0) and "sudden cut-in / occlusion reveal" (spawn later, at a gap
+    defined relative to the ego's position at that instant).
+    """
+
+    spawn_time_s: float
+    spawn_gap_ahead_m: float  # world x offset from ego's position AT SPAWN TIME
+    spawn_speed_mps: float
+    accel_schedule: List[AccelSegment] = field(default_factory=list)
+    length_m: float = 4.5
+    width_m: float = 2.0
+    lateral_offset_m: float = 0.0  # 0.0 = same lane as ego
+
+    def accel_at(self, elapsed_since_spawn_s: float) -> float:
+        if not self.accel_schedule:
+            return 0.0
+        active = 0.0
+        for seg in sorted(self.accel_schedule, key=lambda s: s.t_start_s):
+            if seg.t_start_s <= elapsed_since_spawn_s:
+                active = seg.accel_mps2
+            else:
+                break
+        return active
+
+
+@dataclass
+class ActorRuntime:
+    """Mutable simulation state for one ScriptedActor."""
+
+    spawned: bool = False
+    x: float = 0.0
+    v: float = 0.0
+
+
+# --------------------------------------------------------------------------
+# Naive / optimistic planner (the "upstream AI stack" stand-in)
+# --------------------------------------------------------------------------
+
+
+class CruisePlanner:
+    """A deliberately obstacle-blind planner: it tries to reach and
+    hold a target cruise speed and follow a (possibly time-varying)
+    commanded curvature, with NO awareness of obstacles. This
+    represents the realistic worst case the guard must handle: an
+    upstream perception/planning failure, a stale plan, or a genuinely
+    overconfident neural planner.
+    """
+
+    def __init__(
+        self,
+        target_speed_mps: float,
+        comfort_accel_mps2: float = 2.0,
+        comfort_decel_mps2: float = 2.0,
+        curvature_fn: Optional[Callable[[float], float]] = None,
+    ):
+        self.target_speed_mps = target_speed_mps
+        self.comfort_accel_mps2 = comfort_accel_mps2
+        self.comfort_decel_mps2 = comfort_decel_mps2
+        self.curvature_fn = curvature_fn or (lambda t: 0.0)
+
+    def curvature_at(self, t: float) -> float:
+        return self.curvature_fn(t)
+
+    def generate(
+        self, current_speed_mps: float, t: float, T: int, dt: float
+    ) -> np.ndarray:
+        """Builds a (T, 5) trajectory in the EGO LOCAL frame (x=0, y=0,
+        heading=0 at the current instant), extrapolating toward the
+        target cruise speed at a fixed comfortable accel/decel, using
+        curvature_fn(t) held constant over the horizon at its
+        value at the current planning instant `t`. It never looks at
+        obstacles -- that's the guard's job.
+        """
+        traj = np.zeros((T, 5), dtype=np.float64)
+        v = current_speed_mps
+        x = 0.0
+        heading = 0.0
+        kappa = self.curvature_fn(t)
+        for i in range(T):
+            traj[i] = [x, 0.0, heading, v, kappa]
+            if v < self.target_speed_mps:
+                accel = self.comfort_accel_mps2
+            elif v > self.target_speed_mps:
+                accel = -self.comfort_decel_mps2
+            else:
+                accel = 0.0
+            v = max(v + accel * dt, 0.0)
+            heading += v * kappa * dt
+            x += v * math.cos(heading) * dt
+        return traj
+
+
+# --------------------------------------------------------------------------
+# Ego-frame occupancy grid construction
+# --------------------------------------------------------------------------
+
+
+def build_occupancy_grid(
+    ego: VehicleState,
+    visible_actors_world: Sequence[Tuple[float, float, float, float]],
+    half_extent_m: float,
+    resolution_m: float,
+) -> Tuple[np.ndarray, Tuple[int, int]]:
+    """Builds an ego-centric occupancy grid from a list of
+    (world_x, world_y, length_m, width_m) obstacle footprints, using
+    the exact same (row, col) convention as
+    simplex_guard.nearest_obstacle_distance_ahead:
+        col = origin_col + round(x_local / res)
+        row = origin_row - round(y_local / res)
+    where (x_local, y_local) is the obstacle position rotated into the
+    ego's current heading frame.
+    """
+    size = int(2 * half_extent_m / resolution_m) + 1
+    origin_row = origin_col = size // 2
+    grid = np.zeros((size, size), dtype=bool)
+
+    cos_h, sin_h = math.cos(-ego.heading), math.sin(-ego.heading)
+
+    for wx, wy, length, width in visible_actors_world:
+        dx, dy = wx - ego.x, wy - ego.y
+        # rotate world offset into ego-heading frame
+        x_local = dx * cos_h - dy * sin_h
+        y_local = dx * sin_h + dy * cos_h
+
+        half_l, half_w = length / 2.0, width / 2.0
+        xs = np.arange(x_local - half_l, x_local + half_l + 1e-9, resolution_m * 0.5)
+        ys = np.arange(y_local - half_w, y_local + half_w + 1e-9, resolution_m * 0.5)
+        for gx in xs:
+            for gy in ys:
+                col = origin_col + int(round(gx / resolution_m))
+                row = origin_row - int(round(gy / resolution_m))
+                if 0 <= row < size and 0 <= col < size:
+                    grid[row, col] = True
+
+    return grid, (origin_row, origin_col)
+
+
+# --------------------------------------------------------------------------
+# Scenario result / history
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class StepRecord:
+    t_s: float
+    ego_x: float
+    ego_speed: float
+    overridden: bool
+    fallback_mode: str
+    violations: Tuple[str, ...]
+    min_actor_gap_m: Optional[float]
+    ttc_s: Optional[float]
+
+
+@dataclass
+class ScenarioResult:
+    collided: bool
+    min_clearance_m: float
+    min_ttc_observed_s: Optional[float]
+    override_count: int
+    n_steps: int
+    history: List[StepRecord]
+    max_lateral_accel_observed_mps2: float
+
+    @property
+    def override_fraction(self) -> float:
+        return self.override_count / self.n_steps if self.n_steps else 0.0
+
+
+# --------------------------------------------------------------------------
+# The closed-loop simulator
+# --------------------------------------------------------------------------
+
+
+class ClosedLoopSimulator:
+    def __init__(
+        self,
+        guard: Optional[SimplexGuard] = None,
+        dt_s: float = 0.1,
+        planning_horizon_steps: int = 20,
+        grid_half_extent_m: float = 80.0,
+        grid_resolution_m: float = 0.5,
+        ego_length_m: float = 4.5,
+        mu: Optional[float] = None,
+    ):
+        self.guard = guard or SimplexGuard()
+        self.dt_s = dt_s
+        self.T = planning_horizon_steps
+        self.grid_half_extent_m = grid_half_extent_m
+        self.grid_resolution_m = grid_resolution_m
+        self.ego_length_m = ego_length_m
+        self.mu = mu
+
+    def run(
+        self,
+        ego_init: VehicleState,
+        planner: CruisePlanner,
+        actors: Sequence[ScriptedActor],
+        duration_s: float,
+        dropout_windows: Optional[Sequence[Tuple[float, float]]] = None,
+    ) -> ScenarioResult:
+        dropout_windows = dropout_windows or []
+        ego = ego_init
+        runtimes = [ActorRuntime() for _ in actors]
+        history: List[StepRecord] = []
+
+        n_steps = int(round(duration_s / self.dt_s))
+        min_clearance = math.inf
+        min_ttc: Optional[float] = None
+        collided = False
+        override_count = 0
+        max_lat_accel_observed = 0.0
+
+        t = 0.0
+        for _ in range(n_steps):
+            # --- spawn actors whose spawn time has arrived --------
+            for actor, rt in zip(actors, runtimes):
+                if not rt.spawned and t >= actor.spawn_time_s:
+                    rt.spawned = True
+                    rt.x = ego.x + actor.spawn_gap_ahead_m
+                    rt.v = actor.spawn_speed_mps
+
+            in_dropout = any(lo <= t < hi for lo, hi in dropout_windows)
+            visible = [
+                (rt.x, actor.lateral_offset_m, actor.length_m, actor.width_m)
+                for actor, rt in zip(actors, runtimes)
+                if rt.spawned
+            ]
+
+            if in_dropout:
+                occupancy, origin = None, None
+            else:
+                occupancy, origin = build_occupancy_grid(
+                    ego, visible, self.grid_half_extent_m, self.grid_resolution_m
+                )
+
+            # --- plan + guard check ---------------------------------
+            curvature_now = planner.curvature_at(t)
+            ego_state_arr = np.array([0.0, 0.0, 0.0, ego.speed, curvature_now])
+            candidate_traj = planner.generate(ego.speed, t, self.T, self.dt_s)
+
+            decision, safe_traj, overridden = self.guard.check_and_override(
+                candidate_traj,
+                ego_state_arr,
+                occupancy,
+                dt_s=self.dt_s,
+                resolution_m=self.grid_resolution_m,
+                mu=self.mu,
+                occupancy_origin=origin,
+            )
+            if overridden:
+                override_count += 1
+
+            # --- record metrics using CURRENT (pre-integration) state
+            min_gap_this_step: Optional[float] = None
+            for actor, rt in zip(actors, runtimes):
+                if not rt.spawned:
+                    continue
+                gap = (rt.x - actor.length_m / 2.0) - (ego.x + self.ego_length_m / 2.0)
+                min_clearance = min(min_clearance, gap)
+                min_gap_this_step = gap if min_gap_this_step is None else min(min_gap_this_step, gap)
+                if gap <= 0.0:
+                    collided = True
+
+            if decision.ttc_s is not None:
+                min_ttc = decision.ttc_s if min_ttc is None else min(min_ttc, decision.ttc_s)
+
+            realized_lat_accel = safe_traj[0, 3] ** 2 * safe_traj[0, 4]
+            max_lat_accel_observed = max(max_lat_accel_observed, abs(realized_lat_accel))
+
+            history.append(
+                StepRecord(
+                    t_s=t,
+                    ego_x=ego.x,
+                    ego_speed=ego.speed,
+                    overridden=overridden,
+                    fallback_mode=decision.fallback_mode.value,
+                    violations=tuple(v.value for v in decision.violations),
+                    min_actor_gap_m=min_gap_this_step,
+                    ttc_s=decision.ttc_s,
+                )
+            )
+
+            if collided:
+                # Terminal event: the toy kinematic model has no
+                # contact physics, so continuing to integrate would
+                # let the ego unrealistically drive "through" the
+                # obstacle, and a naive planner would then resume
+                # accelerating on the other side -- an artifact of the
+                # model, not a meaningful post-collision outcome. Stop
+                # the run here; everything after a collision is
+                # undefined for the purposes of this safety test.
+                break
+
+            # --- extract control from the guard's chosen trajectory -
+            if safe_traj.shape[0] >= 2:
+                accel_cmd = float((safe_traj[1, 3] - safe_traj[0, 3]) / self.dt_s)
+            else:
+                accel_cmd = 0.0
+            curvature_cmd = float(safe_traj[0, 4])
+
+            # --- integrate ego and actors by one tick ---------------
+            ego = step_kinematics(ego, accel_cmd, curvature_cmd, self.dt_s)
+            for actor, rt in zip(actors, runtimes):
+                if not rt.spawned:
+                    continue
+                acc = actor.accel_at(t - actor.spawn_time_s)
+                new_x = rt.x + rt.v * self.dt_s
+                new_v = max(rt.v + acc * self.dt_s, 0.0)
+                rt.x, rt.v = new_x, new_v
+
+            t += self.dt_s
+
+        return ScenarioResult(
+            collided=collided,
+            min_clearance_m=min_clearance if math.isfinite(min_clearance) else float("inf"),
+            min_ttc_observed_s=min_ttc,
+            override_count=override_count,
+            n_steps=len(history),
+            history=history,
+            max_lateral_accel_observed_mps2=max_lat_accel_observed,
+        )
