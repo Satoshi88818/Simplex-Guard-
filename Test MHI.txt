@@ -1,0 +1,393 @@
+"""
+test_multi_hypothesis_ilqr.py
+---------------------------------
+Test groups:
+
+  A. Shared helper functions (_solve_cycle, _to_state_trajectory):
+     correctness and consistency with ILQRPlanner's own established
+     behavior (the two index-0 bugs from the previous deliverable are
+     re-checked here since this file reimplements the trajectory
+     conversion independently).
+  B. MultiHypothesisILQRPlanner unit-level: solve count, independent
+     per-hypothesis warm-starting, winner selection, reset behavior.
+  C. THE headline validation: the exact symmetric scenario that
+     collided under the single-hypothesis planner now avoids it.
+     Includes a harder "compound symmetric" case (two mirrored
+     obstacles) to check the fix generalizes past the single-obstacle
+     case it was designed against.
+  D. Regression: already-working asymmetric scenarios are not made
+     worse.
+  E. Honest scope-boundary check: this is NOT a general fix for local
+     non-convexity, and a test documents where it still gives out.
+  F. Adversarial / edge cases.
+"""
+
+import math
+
+import numpy as np
+import pytest
+
+from multi_hypothesis_ilqr import (
+    MultiHypothesisConfig,
+    MultiHypothesisILQRPlanner,
+    _solve_cycle,
+    _to_state_trajectory,
+)
+from full_stack_integration import FullStackSimulator, ILQRPlanner, ILQRPlannerConfig
+from closed_loop_sim import ScriptedActor, VehicleState
+from simplex_guard import SimplexGuard
+
+
+# ==========================================================================
+# A. Shared helper functions
+# ==========================================================================
+
+
+class TestSharedHelpers:
+    def test_solve_cycle_returns_finite_shapes(self):
+        cfg = ILQRPlannerConfig(target_speed_mps=10.0)
+        helper = ILQRPlanner(cfg)
+        ego = VehicleState(x=0, y=0, heading=0, speed=8.0)
+        T = 20
+        U_init = np.tile(np.array([10.0, 0.0]), (T, 1))
+        U, X, cost = _solve_cycle(cfg, helper, ego, 0.0, T, 0.1, [], U_init)
+        assert U.shape == (T, 2)
+        assert X.shape == (T + 1, 3)
+        assert math.isfinite(cost)
+
+    def test_to_state_trajectory_index_zero_speed_is_actual_ego_speed(self):
+        """Same regression as the previous deliverable's Bug 1, now
+        checked against this file's own (independently written, but
+        must be equivalent) conversion helper."""
+        cfg = ILQRPlannerConfig(target_speed_mps=25.0)
+        helper = ILQRPlanner(cfg)
+        ego = VehicleState(x=0, y=0, heading=0, speed=5.0)
+        T = 20
+        U_init = np.tile(np.array([25.0, 0.0]), (T, 1))
+        U, X, _ = _solve_cycle(cfg, helper, ego, 0.0, T, 0.1, [], U_init)
+        traj = _to_state_trajectory(U, X, ego, T)
+        assert traj[0, 3] == pytest.approx(5.0)
+
+    def test_to_state_trajectory_index_zero_curvature_is_fresh_control(self):
+        """Same regression as the previous deliverable's Bug 2."""
+        cfg = ILQRPlannerConfig(target_speed_mps=10.0, risk_weight=500.0)
+        helper = ILQRPlanner(cfg)
+        ego = VehicleState(x=0, y=0, heading=0, speed=10.0)
+        T = 25
+        visible = [(15.0, 2.0, 2.0, 1.5)]
+        U_init = np.tile(np.array([10.0, 0.0]), (T, 1))
+        U, X, _ = _solve_cycle(cfg, helper, ego, 0.0, T, 0.1, visible, U_init)
+        traj = _to_state_trajectory(U, X, ego, T)
+        assert traj[0, 4] != 0.0
+
+    def test_solve_cycle_matches_ilqr_planner_generate_given_same_warm_start(self):
+        """The multi-hypothesis file reimplements the solve+convert
+        pipeline independently (to avoid coupling its per-hypothesis
+        state management to ILQRPlanner's own single-trajectory state)
+        -- this test locks in that the two implementations produce
+        IDENTICAL output given identical inputs, so they can't quietly
+        drift apart.
+        """
+        cfg = ILQRPlannerConfig(target_speed_mps=12.0, risk_weight=200.0)
+        ego = VehicleState(x=0, y=0, heading=0, speed=9.0)
+        visible = [(20.0, 1.5, 2.0, 1.5)]
+        T = 20
+
+        reference_planner = ILQRPlanner(cfg)
+        reference_traj = reference_planner.generate(ego, 0.0, 0.0, T, 0.1, visible)
+
+        helper = ILQRPlanner(cfg)
+        U_init = np.tile(np.array([cfg.target_speed_mps, 0.0]), (T, 1))
+        U, X, _ = _solve_cycle(cfg, helper, ego, 0.0, T, 0.1, visible, U_init)
+        direct_traj = _to_state_trajectory(U, X, ego, T)
+
+        np.testing.assert_allclose(reference_traj, direct_traj, atol=1e-8)
+
+
+# ==========================================================================
+# B. MultiHypothesisILQRPlanner unit-level
+# ==========================================================================
+
+
+class TestMultiHypothesisPlannerUnit:
+    def test_solve_count_matches_number_of_nudges(self):
+        cfg = MultiHypothesisConfig(nudges=(-0.15, 0.0, 0.15))
+        planner = MultiHypothesisILQRPlanner(cfg)
+        ego = VehicleState(x=0, y=0, heading=0, speed=8.0)
+        planner.generate(ego, 0.0, 0.0, 20, 0.1, [])
+        assert planner.last_solve_count == 3
+
+    def test_custom_nudge_count_respected(self):
+        cfg = MultiHypothesisConfig(nudges=(-0.2, -0.1, 0.0, 0.1, 0.2))
+        planner = MultiHypothesisILQRPlanner(cfg)
+        ego = VehicleState(x=0, y=0, heading=0, speed=8.0)
+        planner.generate(ego, 0.0, 0.0, 20, 0.1, [])
+        assert planner.last_solve_count == 5
+
+    def test_last_hypothesis_costs_has_one_entry_per_nudge(self):
+        cfg = MultiHypothesisConfig(nudges=(-0.15, 0.0, 0.15))
+        planner = MultiHypothesisILQRPlanner(cfg)
+        ego = VehicleState(x=0, y=0, heading=0, speed=8.0)
+        planner.generate(ego, 0.0, 0.0, 20, 0.1, [])
+        assert len(planner.last_hypothesis_costs) == 3
+        assert all(math.isfinite(c) for c in planner.last_hypothesis_costs)
+
+    def test_winner_index_points_at_the_minimum_cost(self):
+        cfg = MultiHypothesisConfig(
+            inner=ILQRPlannerConfig(target_speed_mps=15.0, risk_weight=400.0),
+            nudges=(-0.15, 0.0, 0.15),
+        )
+        planner = MultiHypothesisILQRPlanner(cfg)
+        ego = VehicleState(x=0, y=0, heading=0, speed=15.0)
+        visible = [(30.0, 0.0, 2.0, 1.5)]  # symmetric obstacle
+        planner.generate(ego, 0.0, 0.0, 25, 0.1, visible)
+        assert planner.last_winner_index == int(np.argmin(planner.last_hypothesis_costs))
+
+    def test_reset_clears_all_per_hypothesis_warm_starts(self):
+        cfg = MultiHypothesisConfig(nudges=(-0.15, 0.0, 0.15))
+        planner = MultiHypothesisILQRPlanner(cfg)
+        ego = VehicleState(x=0, y=0, heading=0, speed=8.0)
+        planner.generate(ego, 0.0, 0.0, 20, 0.1, [])
+        assert all(u is not None for u in planner._U_prev_per_hypothesis)
+        planner.reset()
+        assert all(u is None for u in planner._U_prev_per_hypothesis)
+        assert planner.last_hypothesis_costs is None
+        assert planner.last_winner_index is None
+
+    def test_hypotheses_warm_start_independently_not_from_the_winner(self):
+        """Each hypothesis's warm start next cycle must come from ITS
+        OWN previous solution, not the previous cycle's winner -- 
+        otherwise all hypotheses would collapse onto the same solution
+        after the first cycle and the whole point of maintaining
+        distinct modes would be lost.
+        """
+        cfg = MultiHypothesisConfig(
+            inner=ILQRPlannerConfig(target_speed_mps=15.0, risk_weight=400.0),
+            nudges=(-0.15, 0.0, 0.15),
+        )
+        planner = MultiHypothesisILQRPlanner(cfg)
+        ego = VehicleState(x=0, y=0, heading=0, speed=15.0)
+        visible = [(30.0, 0.0, 2.0, 1.5)]
+        planner.generate(ego, 0.0, 0.0, 25, 0.1, visible)
+        u_after_cycle1 = [u.copy() for u in planner._U_prev_per_hypothesis]
+        planner.generate(ego, 0.0, 0.1, 25, 0.1, visible)
+        u_after_cycle2 = planner._U_prev_per_hypothesis
+        # The three hypotheses' stored warm-starts must remain
+        # distinguishable from each other after cycle 2 (they would
+        # be near-identical if everything had collapsed onto one
+        # winner's trajectory).
+        d_01 = np.linalg.norm(u_after_cycle2[0] - u_after_cycle2[1])
+        d_12 = np.linalg.norm(u_after_cycle2[1] - u_after_cycle2[2])
+        assert d_01 > 1e-3 or d_12 > 1e-3
+
+
+# ==========================================================================
+# C. Headline validation: the symmetric saddle is now resolved
+# ==========================================================================
+
+
+def make_sim():
+    return FullStackSimulator(guard=SimplexGuard(), dt_s=0.1, planning_horizon_steps=25)
+
+
+class TestSymmetricSaddleResolved:
+    def test_single_hypothesis_baseline_still_collides(self):
+        """Sanity check that the scenario is still a meaningful test
+        of the fix -- confirms the single-hypothesis planner (from the
+        full-stack-integration deliverable) still fails here, so the
+        multi-hypothesis result below is a genuine fix, not a change
+        in the scenario itself.
+        """
+        sim = make_sim()
+        symmetric_obstacle = ScriptedActor(
+            spawn_time_s=0.0, spawn_gap_ahead_m=30.0, spawn_speed_mps=0.0,
+            lateral_offset_m=0.0, length_m=2.0, width_m=1.5,
+        )
+        single = ILQRPlanner(ILQRPlannerConfig(target_speed_mps=15.0, risk_weight=400.0))
+        result = single_result = sim.run(
+            VehicleState(x=0, speed=15.0), single, [symmetric_obstacle], duration_s=8.0
+        )
+        assert result.collided
+
+    def test_multi_hypothesis_avoids_the_exact_scenario_that_collided(self):
+        sim = make_sim()
+        symmetric_obstacle = ScriptedActor(
+            spawn_time_s=0.0, spawn_gap_ahead_m=30.0, spawn_speed_mps=0.0,
+            lateral_offset_m=0.0, length_m=2.0, width_m=1.5,
+        )
+        cfg = MultiHypothesisConfig(inner=ILQRPlannerConfig(target_speed_mps=15.0, risk_weight=400.0))
+        planner = MultiHypothesisILQRPlanner(cfg)
+        result = sim.run(VehicleState(x=0, speed=15.0), planner, [symmetric_obstacle], duration_s=8.0)
+        assert not result.collided
+        assert result.min_clearance_m > 2.5
+
+    def test_compound_symmetric_obstacle_also_resolved(self):
+        """A harder case than the one the fix was designed against:
+        two mirrored obstacles straddling the centerline with
+        overlapping footprints, so the straight-through path is
+        genuinely blocked too (not just "on the centerline" -- there
+        is no zero-curvature solution at all here). Checks the fix
+        generalizes past the single-obstacle scenario.
+        """
+        sim = make_sim()
+        left_obs = ScriptedActor(
+            spawn_time_s=0.0, spawn_gap_ahead_m=30.0, spawn_speed_mps=0.0,
+            lateral_offset_m=1.0, length_m=2.0, width_m=2.2,
+        )
+        right_obs = ScriptedActor(
+            spawn_time_s=0.0, spawn_gap_ahead_m=30.0, spawn_speed_mps=0.0,
+            lateral_offset_m=-1.0, length_m=2.0, width_m=2.2,
+        )
+        cfg = MultiHypothesisConfig(inner=ILQRPlannerConfig(target_speed_mps=15.0, risk_weight=400.0))
+        planner = MultiHypothesisILQRPlanner(cfg)
+        result = sim.run(VehicleState(x=0, speed=15.0), planner, [left_obs, right_obs], duration_s=8.0)
+        assert not result.collided
+
+    def test_compound_symmetric_obstacle_defeats_single_hypothesis(self):
+        """Companion sanity check for the harder scenario above: the
+        single-hypothesis planner must actually fail here too, so the
+        multi-hypothesis result is again a genuine fix and not a
+        scenario that was already easy.
+        """
+        sim = make_sim()
+        left_obs = ScriptedActor(
+            spawn_time_s=0.0, spawn_gap_ahead_m=30.0, spawn_speed_mps=0.0,
+            lateral_offset_m=1.0, length_m=2.0, width_m=2.2,
+        )
+        right_obs = ScriptedActor(
+            spawn_time_s=0.0, spawn_gap_ahead_m=30.0, spawn_speed_mps=0.0,
+            lateral_offset_m=-1.0, length_m=2.0, width_m=2.2,
+        )
+        single = ILQRPlanner(ILQRPlannerConfig(target_speed_mps=15.0, risk_weight=400.0))
+        result = sim.run(VehicleState(x=0, speed=15.0), single, [left_obs, right_obs], duration_s=8.0)
+        assert result.collided
+
+
+# ==========================================================================
+# D. Regression: doesn't break already-working scenarios
+# ==========================================================================
+
+
+class TestRegressionAsymmetricScenariosUnaffected:
+    def test_off_path_obstacle_avoidance_still_works(self):
+        sim = make_sim()
+        obstacle = ScriptedActor(
+            spawn_time_s=0.0, spawn_gap_ahead_m=30.0, spawn_speed_mps=0.0,
+            lateral_offset_m=1.0, length_m=2.0, width_m=1.5,
+        )
+        cfg = MultiHypothesisConfig(inner=ILQRPlannerConfig(target_speed_mps=15.0, risk_weight=400.0))
+        planner = MultiHypothesisILQRPlanner(cfg)
+        result = sim.run(VehicleState(x=0, speed=15.0), planner, [obstacle], duration_s=8.0)
+        assert not result.collided
+        assert result.min_clearance_m > 2.0
+
+    def test_clear_road_reaches_cruise_speed_with_no_false_interventions(self):
+        sim = make_sim()
+        cfg = MultiHypothesisConfig(inner=ILQRPlannerConfig(target_speed_mps=15.0))
+        planner = MultiHypothesisILQRPlanner(cfg)
+        result = sim.run(VehicleState(x=0, speed=10.0), planner, [], duration_s=6.0)
+        assert not result.collided
+        assert result.override_count == 0
+        assert result.history[-1].ego_speed == pytest.approx(15.0, abs=1.5)
+
+    def test_clearance_not_worse_than_single_hypothesis_on_asymmetric_case(self):
+        sim1 = make_sim()
+        sim2 = make_sim()
+        obstacle1 = ScriptedActor(
+            spawn_time_s=0.0, spawn_gap_ahead_m=30.0, spawn_speed_mps=0.0,
+            lateral_offset_m=1.0, length_m=2.0, width_m=1.5,
+        )
+        obstacle2 = ScriptedActor(
+            spawn_time_s=0.0, spawn_gap_ahead_m=30.0, spawn_speed_mps=0.0,
+            lateral_offset_m=1.0, length_m=2.0, width_m=1.5,
+        )
+        single = ILQRPlanner(ILQRPlannerConfig(target_speed_mps=15.0, risk_weight=400.0))
+        r_single = sim1.run(VehicleState(x=0, speed=15.0), single, [obstacle1], duration_s=8.0)
+
+        cfg = MultiHypothesisConfig(inner=ILQRPlannerConfig(target_speed_mps=15.0, risk_weight=400.0))
+        multi = MultiHypothesisILQRPlanner(cfg)
+        r_multi = sim2.run(VehicleState(x=0, speed=15.0), multi, [obstacle2], duration_s=8.0)
+
+        assert r_multi.min_clearance_m >= r_single.min_clearance_m - 0.5
+
+
+# ==========================================================================
+# E. Honest scope-boundary check
+# ==========================================================================
+
+
+class TestScopeBoundary:
+    def test_documents_this_is_not_a_general_non_convexity_fix(self):
+        """This is not claiming the symmetric-saddle problem is solved
+        in general -- only that it's resolved for the scenarios tested
+        (a single centered obstacle, and a compound two-obstacle
+        case). A sufficiently adversarial arrangement -- e.g. one that
+        requires a maneuver NEITHER a left- nor right-leaning initial
+        guess discovers, such as a narrow gap that only opens up after
+        an S-curve -- could still defeat a fixed, small set of
+        hypotheses. We do not claim to have constructed or ruled out
+        such a case; this test only documents that the fix is a
+        finite, enumerable set of starting points, not an exhaustive
+        global search, so the number of hypotheses is a real,
+        adjustable robustness/cost tradeoff rather than a solved
+        problem. See write-up Section 5 for the honest boundary.
+        """
+        cfg = MultiHypothesisConfig(nudges=(-0.15, 0.0, 0.15))
+        assert len(cfg.nudges) == 3  # finite, fixed, not adaptive or exhaustive
+
+
+# ==========================================================================
+# F. Adversarial / edge cases
+# ==========================================================================
+
+
+class TestAdversarialAndEdgeCases:
+    def test_single_nudge_still_works_as_degenerate_case(self):
+        cfg = MultiHypothesisConfig(nudges=(0.0,))
+        planner = MultiHypothesisILQRPlanner(cfg)
+        ego = VehicleState(x=0, y=0, heading=0, speed=8.0)
+        traj = planner.generate(ego, 0.0, 0.0, 20, 0.1, [])
+        assert traj.shape == (20, 5)
+        assert planner.last_solve_count == 1
+
+    def test_zero_nudges_raises_or_handled_gracefully(self):
+        cfg = MultiHypothesisConfig(nudges=())
+        planner = MultiHypothesisILQRPlanner(cfg)
+        ego = VehicleState(x=0, y=0, heading=0, speed=8.0)
+        with pytest.raises(ValueError):
+            planner.generate(ego, 0.0, 0.0, 20, 0.1, [])
+
+    def test_single_step_horizon_does_not_crash(self):
+        cfg = MultiHypothesisConfig(nudges=(-0.1, 0.1))
+        planner = MultiHypothesisILQRPlanner(cfg)
+        ego = VehicleState(x=0, y=0, heading=0, speed=8.0)
+        traj = planner.generate(ego, 0.0, 0.0, 1, 0.1, [])
+        assert traj.shape == (1, 5)
+        assert np.all(np.isfinite(traj))
+
+    def test_result_never_contains_nan_across_randomized_scenarios(self):
+        rng = np.random.default_rng(0)
+        for _ in range(6):
+            sim = make_sim()
+            gap = float(rng.uniform(15, 60))
+            lat = float(rng.uniform(-2, 2))
+            obstacle = ScriptedActor(
+                spawn_time_s=float(rng.uniform(0, 2)), spawn_gap_ahead_m=gap,
+                spawn_speed_mps=float(rng.uniform(0, 15)), lateral_offset_m=lat,
+            )
+            cfg = MultiHypothesisConfig(
+                inner=ILQRPlannerConfig(target_speed_mps=float(rng.uniform(5, 20)), risk_weight=300.0)
+            )
+            planner = MultiHypothesisILQRPlanner(cfg)
+            result = sim.run(
+                VehicleState(x=0, speed=float(rng.uniform(5, 20))), planner, [obstacle], duration_s=6.0
+            )
+            assert all(math.isfinite(r.ego_speed) for r in result.history)
+
+    def test_planner_reset_via_simulator_override_does_not_crash(self):
+        sim = make_sim()
+        cutin = ScriptedActor(spawn_time_s=0.5, spawn_gap_ahead_m=10.0, spawn_speed_mps=0.0)
+        cfg = MultiHypothesisConfig(inner=ILQRPlannerConfig(target_speed_mps=15.0, risk_weight=400.0))
+        planner = MultiHypothesisILQRPlanner(cfg)
+        result = sim.run(VehicleState(x=0, speed=15.0), planner, [cutin], duration_s=5.0)
+        assert all(math.isfinite(r.ego_speed) for r in result.history)
