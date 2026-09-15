@@ -1,0 +1,448 @@
+"""
+test_stateful_simplex_guard.py
+----------------------------------
+Test groups:
+
+  A. Unit-level state machine tests: capture, hold, escalate, release,
+     transparency on the real-data path, and the severity-based merge
+     that must never downgrade a live (occupancy-independent)
+     protection.
+  B. THE headline validation: a properly calibrated scenario
+     (recoverable under continuous protection, NOT recoverable if
+     protection lapses for the dropout duration) run through the
+     closed-loop simulator with the old stateless guard (collides) and
+     the new hold-over guard (does not) -- same scenario, same
+     planner, only the guard differs.
+  C. Grace-period boundary behavior: insufficient grace still
+     escalates and remains safe; very long dropouts stay bounded
+     (escalate once, don't oscillate) and release cleanly on recovery.
+  D. Regression: scenarios with NO hazard at the time of dropout are
+     completely unaffected (transparent pass-through).
+  E. Adversarial / edge cases.
+"""
+
+import math
+
+import numpy as np
+import pytest
+
+from stateful_simplex_guard import (
+    HoldOverState,
+    PROXIMITY_VIOLATIONS,
+    StatefulSimplexGuard,
+)
+from simplex_guard import FallbackMode, SimplexGuard, ViolationType
+from full_stack_integration import FullStackSimulator, NaivePlannerAdapter
+from closed_loop_sim import CruisePlanner, ScriptedActor, VehicleState
+
+
+# ==========================================================================
+# Helpers
+# ==========================================================================
+
+
+def flat_traj(speed, curvature=0.0, T=20, dt=0.1):
+    traj = np.zeros((T, 5))
+    x = 0.0
+    for t in range(T):
+        traj[t] = [x, 0.0, 0.0, speed, curvature]
+        x += speed * dt
+    return traj
+
+
+def occupancy_with_obstacle_ahead(distance_m, resolution=0.5, size=401):
+    grid = np.zeros((size, size), dtype=bool)
+    origin = size // 2
+    col = origin + int(round(distance_m / resolution))
+    grid[origin - 2 : origin + 3, col] = True
+    return grid, (origin, origin), resolution
+
+
+def empty_occupancy(size=401):
+    return np.zeros((size, size), dtype=bool)
+
+
+# ==========================================================================
+# A. Unit-level state machine
+# ==========================================================================
+
+
+class TestStateMachineBasics:
+    def test_starts_idle(self):
+        guard = StatefulSimplexGuard()
+        assert guard.state == HoldOverState.IDLE
+        assert guard.held_fallback_mode is None
+
+    def test_real_data_no_hazard_stays_idle_and_transparent(self):
+        guard = StatefulSimplexGuard()
+        traj = flat_traj(5.0)
+        ego = np.array([0, 0, 0, 5.0, 0.0])
+        occ = empty_occupancy()
+        decision, safe_traj, overridden = guard.check_and_override(traj, ego, occ, dt_s=0.1)
+        assert not overridden
+        assert guard.state == HoldOverState.IDLE
+
+    def test_real_data_with_hazard_captures_into_holding(self):
+        guard = StatefulSimplexGuard()
+        traj = flat_traj(20.0)
+        ego = np.array([0, 0, 0, 20.0, 0.0])
+        occ, origin, res = occupancy_with_obstacle_ahead(18.0)
+        decision, safe_traj, overridden = guard.check_and_override(
+            traj, ego, occ, dt_s=0.1, resolution_m=res, occupancy_origin=origin
+        )
+        assert overridden
+        assert guard.state == HoldOverState.HOLDING
+        assert guard.held_fallback_mode == decision.fallback_mode
+
+    def test_dropout_with_no_prior_hazard_is_pure_passthrough(self):
+        """This is the critical regression check against over-
+        triggering: a dropout with NOTHING known to hold over must
+        behave EXACTLY like the stateless guard -- no invented
+        interventions.
+        """
+        guard = StatefulSimplexGuard()
+        stateless = SimplexGuard()
+        traj = flat_traj(10.0)
+        ego = np.array([0, 0, 0, 10.0, 0.0])
+        d1, t1, o1 = guard.check_and_override(traj, ego, None, dt_s=0.1)
+        d2, t2, o2 = stateless.check_and_override(traj, ego, None, dt_s=0.1)
+        assert o1 == o2 == False
+        np.testing.assert_array_equal(t1, t2)
+        assert guard.state == HoldOverState.IDLE
+
+    def test_dropout_within_grace_continues_holding_at_captured_severity(self):
+        guard = StatefulSimplexGuard(hold_over_grace_s=1.0)
+        traj = flat_traj(20.0)
+        ego = np.array([0, 0, 0, 20.0, 0.0])
+        occ, origin, res = occupancy_with_obstacle_ahead(18.0)
+        guard.check_and_override(traj, ego, occ, dt_s=0.1, resolution_m=res, occupancy_origin=origin)
+        captured_mode = guard.held_fallback_mode
+
+        ego2 = np.array([0, 0, 0, 19.0, 0.0])
+        decision, safe_traj, overridden = guard.check_and_override(traj, ego2, None, dt_s=0.1)
+        assert overridden
+        assert guard.state == HoldOverState.HOLDING
+        assert decision.fallback_mode == captured_mode
+
+    def test_held_trajectory_uses_current_ego_speed_not_stale_speed(self):
+        """The regenerated fallback must reflect the vehicle's CURRENT
+        (possibly already-reduced) speed each cycle, not the speed at
+        the moment occupancy was lost.
+        """
+        guard = StatefulSimplexGuard(hold_over_grace_s=2.0)
+        traj = flat_traj(20.0)
+        ego = np.array([0, 0, 0, 20.0, 0.0])
+        occ, origin, res = occupancy_with_obstacle_ahead(18.0)
+        guard.check_and_override(traj, ego, occ, dt_s=0.1, resolution_m=res, occupancy_origin=origin)
+
+        ego_slower = np.array([0, 0, 0, 12.0, 0.0])
+        _, safe_traj, _ = guard.check_and_override(traj, ego_slower, None, dt_s=0.1)
+        assert safe_traj[0, 3] == pytest.approx(12.0)
+
+    def test_grace_period_expiry_escalates_to_emergency(self):
+        guard = StatefulSimplexGuard(hold_over_grace_s=0.3)
+        traj = flat_traj(15.0)
+        ego = np.array([0, 0, 0, 15.0, 0.0])
+        occ, origin, res = occupancy_with_obstacle_ahead(25.0)
+        # Trigger a COMFORT-level hold (soft TTC only).
+        d0, _, _ = guard.check_and_override(traj, ego, occ, dt_s=0.1, resolution_m=res, occupancy_origin=origin)
+        assert d0.fallback_mode == FallbackMode.COMFORT_STOP
+        # Advance through dropout past the 0.3s grace.
+        for _ in range(5):
+            d, _, _ = guard.check_and_override(traj, ego, None, dt_s=0.1)
+        assert guard.state == HoldOverState.ESCALATED
+        assert d.fallback_mode == FallbackMode.EMERGENCY_STOP
+
+    def test_escalation_persists_not_one_shot(self):
+        """Once escalated, the guard must STAY escalated for as long
+        as sensing remains unavailable -- not escalate once and then
+        quietly revert to the (now stale) comfort-level hold.
+        """
+        guard = StatefulSimplexGuard(hold_over_grace_s=0.2)
+        traj = flat_traj(15.0)
+        ego = np.array([0, 0, 0, 15.0, 0.0])
+        occ, origin, res = occupancy_with_obstacle_ahead(25.0)
+        guard.check_and_override(traj, ego, occ, dt_s=0.1, resolution_m=res, occupancy_origin=origin)
+        modes = []
+        for _ in range(10):
+            d, _, _ = guard.check_and_override(traj, ego, None, dt_s=0.1)
+            modes.append(d.fallback_mode)
+        first_escalated = modes.index(FallbackMode.EMERGENCY_STOP)
+        assert all(m == FallbackMode.EMERGENCY_STOP for m in modes[first_escalated:])
+
+    def test_recovery_with_confirmed_clear_releases_to_idle(self):
+        guard = StatefulSimplexGuard(hold_over_grace_s=1.0)
+        traj = flat_traj(15.0)
+        ego = np.array([0, 0, 0, 15.0, 0.0])
+        occ, origin, res = occupancy_with_obstacle_ahead(20.0)
+        guard.check_and_override(traj, ego, occ, dt_s=0.1, resolution_m=res, occupancy_origin=origin)
+        guard.check_and_override(traj, ego, None, dt_s=0.1)
+        assert guard.state == HoldOverState.HOLDING
+
+        clear = empty_occupancy()
+        decision, _, overridden = guard.check_and_override(traj, ego, clear, dt_s=0.1)
+        assert not overridden
+        assert guard.state == HoldOverState.IDLE
+        assert guard.held_fallback_mode is None
+
+    def test_grace_boundary_exactly_at_limit_still_holding(self):
+        """Documents the exact boundary policy: elapsed == grace is
+        still within HOLDING, only elapsed > grace escalates."""
+        guard = StatefulSimplexGuard(hold_over_grace_s=0.2)
+        traj = flat_traj(15.0)
+        ego = np.array([0, 0, 0, 15.0, 0.0])
+        occ, origin, res = occupancy_with_obstacle_ahead(25.0)
+        guard.check_and_override(traj, ego, occ, dt_s=0.1, resolution_m=res, occupancy_origin=origin)
+        # One dropout cycle of exactly 0.2s -> elapsed == grace exactly.
+        guard.check_and_override(traj, ego, None, dt_s=0.2)
+        assert guard.state == HoldOverState.HOLDING
+
+    def test_reset_clears_all_memory(self):
+        guard = StatefulSimplexGuard()
+        traj = flat_traj(20.0)
+        ego = np.array([0, 0, 0, 20.0, 0.0])
+        occ, origin, res = occupancy_with_obstacle_ahead(18.0)
+        guard.check_and_override(traj, ego, occ, dt_s=0.1, resolution_m=res, occupancy_origin=origin)
+        assert guard.state != HoldOverState.IDLE
+        guard.reset()
+        assert guard.state == HoldOverState.IDLE
+        assert guard.held_fallback_mode is None
+        assert guard.elapsed_without_data_s == 0.0
+
+
+class TestSeverityMergeNeverDowngrades:
+    def test_live_lateral_violation_during_dropout_not_suppressed_by_comfort_hold(self):
+        guard = StatefulSimplexGuard(hold_over_grace_s=2.0)
+        # Capture a COMFORT-level proximity hold first.
+        traj_straight = flat_traj(15.0)
+        ego = np.array([0, 0, 0, 15.0, 0.0])
+        occ, origin, res = occupancy_with_obstacle_ahead(25.0)
+        d0, _, _ = guard.check_and_override(
+            traj_straight, ego, occ, dt_s=0.1, resolution_m=res, occupancy_origin=origin
+        )
+        assert d0.fallback_mode == FallbackMode.COMFORT_STOP
+
+        # During dropout, the CANDIDATE trajectory now requests an
+        # unsafe corner -- this is live and occupancy-independent, and
+        # more severe (SPEED_LIMIT_CORNER > COMFORT_STOP in this
+        # guard's own severity ranking) than the held memory.
+        traj_corner = flat_traj(25.0, curvature=0.05)
+        ego_corner = np.array([0, 0, 0, 25.0, 0.05])
+        decision, safe_traj, overridden = guard.check_and_override(traj_corner, ego_corner, None, dt_s=0.1)
+        assert overridden
+        assert decision.fallback_mode == FallbackMode.SPEED_LIMIT_CORNER
+
+    def test_invalid_sensor_input_always_wins_over_held_memory(self):
+        guard = StatefulSimplexGuard(hold_over_grace_s=2.0)
+        traj = flat_traj(15.0)
+        ego = np.array([0, 0, 0, 15.0, 0.0])
+        occ, origin, res = occupancy_with_obstacle_ahead(25.0)
+        guard.check_and_override(traj, ego, occ, dt_s=0.1, resolution_m=res, occupancy_origin=origin)
+
+        bad_ego = np.array([0, 0, 0, float("nan"), 0.0])
+        decision, safe_traj, overridden = guard.check_and_override(traj, bad_ego, None, dt_s=0.1)
+        assert overridden
+        assert decision.fallback_mode == FallbackMode.EMERGENCY_STOP
+        assert ViolationType.INVALID_SENSOR_INPUT in decision.violations
+        assert np.all(np.isfinite(safe_traj))
+
+    def test_invalid_sensor_input_on_real_data_cycle_does_not_corrupt_memory(self):
+        guard = StatefulSimplexGuard(hold_over_grace_s=2.0)
+        traj = flat_traj(15.0)
+        ego = np.array([0, 0, 0, 15.0, 0.0])
+        occ, origin, res = occupancy_with_obstacle_ahead(25.0)
+        guard.check_and_override(traj, ego, occ, dt_s=0.1, resolution_m=res, occupancy_origin=origin)
+        captured_state = guard.state
+        captured_mode = guard.held_fallback_mode
+
+        bad_ego = np.array([0, 0, 0, float("nan"), 0.0])
+        # occupancy IS present this cycle, but ego_state is garbage.
+        guard.check_and_override(traj, bad_ego, occ, dt_s=0.1, resolution_m=res, occupancy_origin=origin)
+        # Memory must be untouched by the garbage-data cycle.
+        assert guard.state == captured_state
+        assert guard.held_fallback_mode == captured_mode
+
+
+# ==========================================================================
+# B. Headline validation: properly calibrated collision-relevant scenario
+# ==========================================================================
+
+
+def make_scenario_lead():
+    return ScriptedActor(spawn_time_s=0.5, spawn_gap_ahead_m=45.0, spawn_speed_mps=0.0)
+
+
+class TestHeadlineScenario:
+    def test_recoverable_under_full_continuous_protection_no_dropout(self):
+        """Sanity check: this scenario is genuinely recoverable when
+        protection never lapses -- establishes the baseline the
+        dropout tests below are measured against.
+        """
+        sim = FullStackSimulator(guard=SimplexGuard(), dt_s=0.1, planning_horizon_steps=20)
+        naive = NaivePlannerAdapter(CruisePlanner(target_speed_mps=15.0))
+        result = sim.run(VehicleState(x=0, speed=15.0), naive, [make_scenario_lead()], duration_s=8.0)
+        assert not result.collided
+        assert result.min_clearance_m > 0.5
+
+    def test_old_stateless_guard_collides_when_dropout_hits_mid_brake(self):
+        sim = FullStackSimulator(guard=SimplexGuard(), dt_s=0.1, planning_horizon_steps=20)
+        naive = NaivePlannerAdapter(CruisePlanner(target_speed_mps=15.0))
+        result = sim.run(
+            VehicleState(x=0, speed=15.0), naive, [make_scenario_lead()],
+            duration_s=8.0, dropout_windows=[(0.7, 1.7)],
+        )
+        assert result.collided, (
+            "setup invalid: this scenario is meant to demonstrate the "
+            "stateless guard's known gap by actually colliding under "
+            "it -- if it no longer collides, recalibrate the scenario"
+        )
+
+    def test_new_hold_over_guard_avoids_the_exact_same_scenario(self):
+        sim = FullStackSimulator(guard=StatefulSimplexGuard(hold_over_grace_s=1.5), dt_s=0.1, planning_horizon_steps=20)
+        naive = NaivePlannerAdapter(CruisePlanner(target_speed_mps=15.0))
+        result = sim.run(
+            VehicleState(x=0, speed=15.0), naive, [make_scenario_lead()],
+            duration_s=8.0, dropout_windows=[(0.7, 1.7)],
+        )
+        assert not result.collided
+        assert result.min_clearance_m > 0.5
+
+
+# ==========================================================================
+# C. Grace-period boundary behavior in closed loop
+# ==========================================================================
+
+
+class TestGracePeriodBoundaryInClosedLoop:
+    def test_insufficient_grace_still_escalates_and_stays_safe(self):
+        """Even when the configured grace period is SHORTER than the
+        actual dropout, escalating to emergency stop partway through
+        must still be enough to avoid collision in this scenario
+        (the grace period bounds how long we ASSUME the old severity
+        is still valid, not how long we protect at all)."""
+        sim = FullStackSimulator(guard=StatefulSimplexGuard(hold_over_grace_s=0.3), dt_s=0.1, planning_horizon_steps=20)
+        naive = NaivePlannerAdapter(CruisePlanner(target_speed_mps=15.0))
+        result = sim.run(
+            VehicleState(x=0, speed=15.0), naive, [make_scenario_lead()],
+            duration_s=8.0, dropout_windows=[(0.7, 1.7)],
+        )
+        assert not result.collided
+
+    def test_very_long_dropout_remains_bounded_and_safe(self):
+        guard = StatefulSimplexGuard(hold_over_grace_s=1.5)
+        sim = FullStackSimulator(guard=guard, dt_s=0.1, planning_horizon_steps=20)
+        naive = NaivePlannerAdapter(CruisePlanner(target_speed_mps=15.0))
+        result = sim.run(
+            VehicleState(x=0, speed=15.0), naive, [make_scenario_lead()],
+            duration_s=8.0, dropout_windows=[(0.7, 5.0)],
+        )
+        assert not result.collided
+        assert all(math.isfinite(r.ego_speed) for r in result.history)
+
+    def test_zero_grace_period_escalates_immediately_on_any_dropout(self):
+        guard = StatefulSimplexGuard(hold_over_grace_s=0.0)
+        traj = flat_traj(15.0)
+        ego = np.array([0, 0, 0, 15.0, 0.0])
+        occ, origin, res = occupancy_with_obstacle_ahead(25.0)
+        guard.check_and_override(traj, ego, occ, dt_s=0.1, resolution_m=res, occupancy_origin=origin)
+        decision, _, _ = guard.check_and_override(traj, ego, None, dt_s=0.1)
+        assert guard.state == HoldOverState.ESCALATED
+        assert decision.fallback_mode == FallbackMode.EMERGENCY_STOP
+
+
+# ==========================================================================
+# D. Regression: no-hazard scenarios unaffected
+# ==========================================================================
+
+
+class TestRegressionNoHazardUnaffected:
+    def test_clear_road_with_dropout_behaves_identically_to_stateless(self):
+        sim_old = FullStackSimulator(guard=SimplexGuard(), dt_s=0.1, planning_horizon_steps=20)
+        sim_new = FullStackSimulator(guard=StatefulSimplexGuard(), dt_s=0.1, planning_horizon_steps=20)
+        naive_old = NaivePlannerAdapter(CruisePlanner(target_speed_mps=15.0))
+        naive_new = NaivePlannerAdapter(CruisePlanner(target_speed_mps=15.0))
+        r_old = sim_old.run(VehicleState(x=0, speed=10.0), naive_old, [], duration_s=6.0, dropout_windows=[(1.0, 2.0)])
+        r_new = sim_new.run(VehicleState(x=0, speed=10.0), naive_new, [], duration_s=6.0, dropout_windows=[(1.0, 2.0)])
+        assert r_old.collided == r_new.collided == False
+        assert r_old.override_count == r_new.override_count == 0
+        for a, b in zip(r_old.history, r_new.history):
+            assert a.ego_speed == pytest.approx(b.ego_speed)
+
+
+# ==========================================================================
+# E. Adversarial / edge cases
+# ==========================================================================
+
+
+class TestAdversarialAndEdgeCases:
+    def test_negative_grace_period_rejected(self):
+        with pytest.raises(ValueError):
+            StatefulSimplexGuard(hold_over_grace_s=-1.0)
+
+    def test_config_property_delegates_to_inner_guard(self):
+        inner = SimplexGuard()
+        guard = StatefulSimplexGuard(inner_guard=inner)
+        assert guard.config is inner.config
+
+    def test_dropout_immediately_on_first_call_does_not_crash(self):
+        guard = StatefulSimplexGuard()
+        traj = flat_traj(10.0)
+        ego = np.array([0, 0, 0, 10.0, 0.0])
+        decision, safe_traj, overridden = guard.check_and_override(traj, ego, None, dt_s=0.1)
+        assert not overridden
+        assert np.all(np.isfinite(safe_traj))
+
+    def test_result_never_contains_nan_across_randomized_dropout_scenarios(self):
+        rng = np.random.default_rng(0)
+        for _ in range(8):
+            sim = FullStackSimulator(
+                guard=StatefulSimplexGuard(hold_over_grace_s=float(rng.uniform(0.2, 2.0))),
+                dt_s=0.1, planning_horizon_steps=20,
+            )
+            naive = NaivePlannerAdapter(CruisePlanner(target_speed_mps=float(rng.uniform(5, 20))))
+            gap = float(rng.uniform(15, 60))
+            lead = ScriptedActor(spawn_time_s=float(rng.uniform(0, 2)), spawn_gap_ahead_m=gap, spawn_speed_mps=0.0)
+            dropout_start = float(rng.uniform(0.3, 2.0))
+            dropout_end = dropout_start + float(rng.uniform(0.2, 3.0))
+            result = sim.run(
+                VehicleState(x=0, speed=float(rng.uniform(5, 20))), naive, [lead],
+                duration_s=8.0, dropout_windows=[(dropout_start, dropout_end)],
+            )
+            assert all(math.isfinite(r.ego_speed) for r in result.history)
+
+    def test_multiple_dropout_windows_in_sequence(self):
+        guard = StatefulSimplexGuard(hold_over_grace_s=1.0)
+        sim = FullStackSimulator(guard=guard, dt_s=0.1, planning_horizon_steps=20)
+        naive = NaivePlannerAdapter(CruisePlanner(target_speed_mps=15.0))
+        result = sim.run(
+            VehicleState(x=0, speed=15.0), naive, [make_scenario_lead()],
+            duration_s=8.0, dropout_windows=[(0.7, 1.2), (1.5, 1.8)],
+        )
+        assert all(math.isfinite(r.ego_speed) for r in result.history)
+
+    def test_proximity_violations_tuple_matches_documented_set(self):
+        assert set(PROXIMITY_VIOLATIONS) == {
+            ViolationType.TTC_HARD,
+            ViolationType.TTC_SOFT,
+            ViolationType.STOPPING_DISTANCE,
+        }
+
+    def test_defensive_fallback_when_held_violations_invariant_is_broken(self):
+        """`_held_violations` should always be non-empty whenever
+        `state != IDLE` (they are set together on capture and never
+        cleared independently) -- this directly exercises the
+        defensive fallback that exists in case that invariant is ever
+        violated by a future change, by breaking it deliberately.
+        """
+        guard = StatefulSimplexGuard(hold_over_grace_s=2.0)
+        traj = flat_traj(15.0)
+        ego = np.array([0, 0, 0, 15.0, 0.0])
+        occ, origin, res = occupancy_with_obstacle_ahead(25.0)
+        guard.check_and_override(traj, ego, occ, dt_s=0.1, resolution_m=res, occupancy_origin=origin)
+        assert guard.state == HoldOverState.HOLDING
+
+        guard._held_violations = ()  # deliberately break the invariant
+        decision, safe_traj, overridden = guard.check_and_override(traj, ego, None, dt_s=0.1)
+        assert overridden
+        assert len(decision.violations) > 0
+        assert np.all(np.isfinite(safe_traj))
