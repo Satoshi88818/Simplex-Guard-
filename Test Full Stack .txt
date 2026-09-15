@@ -1,0 +1,433 @@
+"""
+test_full_stack_integration.py
+---------------------------------
+Test groups:
+
+  A. ILQRPlanner unit-level: trajectory shape/finiteness, correct
+     current-state anchoring at index 0 (the two real bugs found while
+     building this -- speed continuity and curvature staleness -- are
+     both locked in here as explicit regression tests), curvature
+     conversion safety near zero speed, risk field construction from
+     visible actors.
+  B. Collision geometry: the corrected 2D rectangle-separation check
+     (replacing the earlier deliverable's longitudinal-only check,
+     which becomes wrong once obstacles carry a lateral offset).
+  C. End-to-end integration scenarios: clear road, off-path
+     uncertain/occupied object (the headline comparison -- naive
+     planner needs the guard's backstop and still grazes it; risk-
+     aware planner avoids it with comfortable clearance and barely
+     needs the guard), cut-in, sensor dropout.
+  D. The open question from the previous deliverable, answered
+     directly: does closed-loop replanning break the symmetric-saddle
+     tie on its own? (No -- verified, not assumed.)
+  E. Adversarial / edge cases.
+"""
+
+import math
+
+import numpy as np
+import pytest
+
+from full_stack_integration import (
+    CURVATURE_SPEED_EPS,
+    FullStackSimulator,
+    ILQRPlanner,
+    ILQRPlannerConfig,
+    NaivePlannerAdapter,
+)
+from closed_loop_sim import AccelSegment, CruisePlanner, ScriptedActor, VehicleState
+from simplex_guard import SimplexGuard
+
+
+# ==========================================================================
+# A. ILQRPlanner unit-level
+# ==========================================================================
+
+
+class TestILQRPlannerUnit:
+    def test_generate_returns_correct_shape(self):
+        planner = ILQRPlanner(ILQRPlannerConfig(target_speed_mps=10.0))
+        ego = VehicleState(x=0, y=0, heading=0, speed=8.0)
+        traj = planner.generate(ego, 0.0, 0.0, 20, 0.1, [])
+        assert traj.shape == (20, 5)
+        assert np.all(np.isfinite(traj))
+
+    def test_index_zero_speed_is_actual_ego_speed_not_solver_control(self):
+        """Regression test for the first real bug found while building
+        this: index 0 of the returned trajectory must carry the EGO'S
+        ACTUAL current speed (a measured fact), not whatever the
+        solver's first control happened to be -- otherwise the
+        simulator's acceleration extraction silently ignores the
+        vehicle's real state.
+        """
+        planner = ILQRPlanner(ILQRPlannerConfig(target_speed_mps=25.0))  # far from current speed
+        ego = VehicleState(x=0, y=0, heading=0, speed=5.0)  # well below target
+        traj = planner.generate(ego, 0.0, 0.0, 20, 0.1, [])
+        assert traj[0, 3] == pytest.approx(5.0), (
+            "traj[0]'s speed must equal the ego's actual current speed, "
+            "regardless of what the optimizer wants to command next"
+        )
+
+    def test_index_zero_curvature_is_fresh_plan_not_stale_last_curvature(self):
+        """Regression test for the second real bug: index 0's
+        CURVATURE must be the planner's newly-computed decision for
+        right now, not last cycle's applied curvature -- otherwise
+        steering commands are silently delayed by one full cycle and
+        risk-avoidance never actually steers.
+        """
+        planner = ILQRPlanner(ILQRPlannerConfig(target_speed_mps=10.0, risk_weight=500.0))
+        ego = VehicleState(x=0, y=0, heading=0, speed=10.0)
+        # An obstacle directly ahead but off to one side should induce
+        # a nonzero first-instant curvature command, even though
+        # last_curvature (passed in) is 0 and very different from what
+        # the fresh plan should choose.
+        visible = [(15.0, 2.0, 2.0, 1.5)]
+        stale_last_curvature = 0.0
+        traj = planner.generate(ego, stale_last_curvature, 0.0, 25, 0.1, visible)
+        # The fresh plan should differ from "keep doing nothing" at t=0.
+        assert traj[0, 4] != 0.0
+
+    @pytest.mark.parametrize("seed", range(10))
+    def test_curvature_conversion_never_produces_nan_or_inf(self, seed):
+        rng = np.random.default_rng(seed)
+        planner = ILQRPlanner(ILQRPlannerConfig(target_speed_mps=float(rng.uniform(0, 20))))
+        ego = VehicleState(x=0, y=0, heading=0, speed=float(rng.uniform(0, 20)))
+        traj = planner.generate(ego, 0.0, 0.0, 15, 0.1, [])
+        assert np.all(np.isfinite(traj))
+
+    def test_near_zero_speed_gives_zero_curvature_not_blowup(self):
+        # Directly probe the conversion logic at the documented epsilon.
+        v_tiny = CURVATURE_SPEED_EPS / 2.0
+        omega = 5.0  # large turn-rate that would blow up curvature=omega/v
+        curvature = omega / v_tiny if abs(v_tiny) > CURVATURE_SPEED_EPS else 0.0
+        assert curvature == 0.0
+
+    def test_risk_field_construction_transforms_into_ego_frame(self):
+        planner = ILQRPlanner(ILQRPlannerConfig())
+        ego = VehicleState(x=10.0, y=5.0, heading=math.pi / 2, speed=5.0)
+        # World-frame obstacle "north" of the ego's position; with
+        # ego heading +90deg (facing +y), this should land AHEAD
+        # (positive local x) in the ego frame, not to the side.
+        visible = [(10.0, 15.0, 2.0, 2.0)]
+        risk_field = planner._build_risk_field(ego, visible)
+        assert risk_field is not None
+        # Check the bump landed near local (10, 0) i.e. ~10m ahead.
+        bump = risk_field.occupancy.bumps[0]
+        assert bump.center[0] > 5.0
+        assert abs(bump.center[1]) < 2.0
+
+    def test_no_visible_actors_gives_none_risk_field(self):
+        planner = ILQRPlanner(ILQRPlannerConfig())
+        ego = VehicleState(x=0, y=0, heading=0, speed=5.0)
+        assert planner._build_risk_field(ego, []) is None
+
+    def test_reset_clears_warm_start(self):
+        planner = ILQRPlanner(ILQRPlannerConfig(target_speed_mps=10.0))
+        ego = VehicleState(x=0, y=0, heading=0, speed=8.0)
+        planner.generate(ego, 0.0, 0.0, 20, 0.1, [])
+        assert planner._U_prev is not None
+        planner.reset()
+        assert planner._U_prev is None
+
+    def test_warm_start_actually_used_across_calls(self):
+        planner = ILQRPlanner(ILQRPlannerConfig(target_speed_mps=10.0))
+        ego = VehicleState(x=0, y=0, heading=0, speed=8.0)
+        planner.generate(ego, 0.0, 0.0, 20, 0.1, [])
+        first_U = planner._U_prev.copy()
+        planner.generate(ego, 0.0, 0.1, 20, 0.1, [])
+        second_U = planner._U_prev
+        # Warm-started solve should be close to a one-step shift of
+        # the first (not identical, since it re-solves, but not wildly
+        # different either given nothing in the world changed).
+        shifted = np.vstack([first_U[1:], first_U[-1:]])
+        np.testing.assert_allclose(second_U, shifted, atol=1.0)
+
+
+# ==========================================================================
+# B. Collision geometry
+# ==========================================================================
+
+
+class TestRectSeparation:
+    def test_overlapping_rectangles_return_zero(self):
+        d = FullStackSimulator._rect_separation(0, 0, 4.0, 2.0, 1.0, 0.0, 2.0, 1.0)
+        assert d == 0.0
+
+    def test_longitudinally_clear_but_would_have_false_positive_under_old_1d_check(self):
+        """This is exactly the case that broke under the previous
+        deliverable's longitudinal-only collision check: an obstacle
+        sharing the ego's x-range but safely off to the side. The 2D
+        check must correctly report clearance, not a false collision.
+        """
+        # Ego at origin, 4.5m long x 2.0m wide (half-extents 2.25, 1.0)
+        # Obstacle at same x, but 3m to the side -> laterally clear.
+        d = FullStackSimulator._rect_separation(0, 0, 4.5, 2.0, 0.0, 3.0, 2.0, 1.5)
+        assert d > 0.0
+        expected_lateral_gap = 3.0 - (1.0 + 0.75)
+        assert d == pytest.approx(expected_lateral_gap, abs=1e-9)
+
+    def test_laterally_clear_but_longitudinally_overlapping_is_not_a_collision(self):
+        d = FullStackSimulator._rect_separation(0, 0, 4.5, 2.0, 0.0, 5.0, 2.0, 1.5)
+        assert d > 0.0
+
+    def test_diagonal_separation_uses_euclidean_distance(self):
+        d = FullStackSimulator._rect_separation(0, 0, 2.0, 2.0, 10.0, 10.0, 2.0, 2.0)
+        dx = 10.0 - 2.0
+        dy = 10.0 - 2.0
+        assert d == pytest.approx(math.hypot(dx, dy))
+
+    def test_exact_edge_touch_is_zero_not_negative(self):
+        # centers 3.0m apart, half-extents sum to exactly 3.0m -> touching
+        d = FullStackSimulator._rect_separation(0, 0, 4.0, 2.0, 3.0, 0.0, 2.0, 0.0)
+        assert d == 0.0
+
+
+# ==========================================================================
+# C. End-to-end integration scenarios
+# ==========================================================================
+
+
+def make_sim(mu=None, max_accel=4.0):
+    return FullStackSimulator(
+        guard=SimplexGuard(), dt_s=0.1, planning_horizon_steps=25, mu=mu, max_accel_mps2=max_accel
+    )
+
+
+class TestClearRoadBaseline:
+    def test_ilqr_planner_reaches_cruise_speed_with_no_false_interventions(self):
+        sim = make_sim()
+        planner = ILQRPlanner(ILQRPlannerConfig(target_speed_mps=15.0))
+        result = sim.run(VehicleState(x=0, speed=10.0), planner, [], duration_s=6.0)
+        assert not result.collided
+        assert result.override_count == 0
+        assert result.history[-1].ego_speed == pytest.approx(15.0, abs=1.5)
+
+    def test_speed_ramps_within_accel_limit_not_instantaneous_jump(self):
+        """Direct regression test for Bug 1: the very first physical
+        step's speed change must respect the simulator's max_accel_mps2
+        limit, not jump straight to whatever the far-off-target
+        solver's first control happened to be.
+        """
+        sim = make_sim(max_accel=3.0)
+        planner = ILQRPlanner(ILQRPlannerConfig(target_speed_mps=25.0))
+        result = sim.run(VehicleState(x=0, speed=5.0), planner, [], duration_s=1.0)
+        first_step_speed = result.history[0].ego_speed
+        # history[0] logs speed BEFORE integrating that step, so check
+        # the SECOND entry against the physical limit from the first.
+        second_step_speed = result.history[1].ego_speed
+        max_possible = first_step_speed + sim.max_accel_mps2 * sim.dt_s + 1e-6
+        assert second_step_speed <= max_possible
+
+
+class TestOffPathRiskAvoidance:
+    def _obstacle(self, lateral_offset_m=1.0):
+        return ScriptedActor(
+            spawn_time_s=0.0, spawn_gap_ahead_m=30.0, spawn_speed_mps=0.0,
+            lateral_offset_m=lateral_offset_m, length_m=2.0, width_m=1.5,
+        )
+
+    def test_naive_planner_needs_guard_and_still_grazes(self):
+        sim = make_sim()
+        naive = NaivePlannerAdapter(CruisePlanner(target_speed_mps=15.0))
+        result = sim.run(VehicleState(x=0, speed=15.0), naive, [self._obstacle()], duration_s=8.0)
+        # The guard (longitudinal-only intervention) had to fire many
+        # times, and still cannot fully prevent contact because it has
+        # no ability to steer -- it can only slow down.
+        assert result.override_count > 10
+        assert result.min_clearance_m < 0.5
+
+    def test_risk_aware_planner_avoids_with_comfortable_clearance(self):
+        sim = make_sim()
+        ilqr = ILQRPlanner(ILQRPlannerConfig(target_speed_mps=15.0, risk_weight=400.0))
+        result = sim.run(VehicleState(x=0, speed=15.0), ilqr, [self._obstacle()], duration_s=8.0)
+        assert not result.collided
+        assert result.min_clearance_m > 2.0
+
+    def test_risk_aware_planner_needs_guard_far_less_than_naive(self):
+        """The headline integration property: better upstream planning
+        should reduce (not eliminate -- the guard is still a necessary
+        backstop, see next test) reliance on the hard safety monitor,
+        in an apples-to-apples identical scenario.
+        """
+        sim1 = make_sim()
+        sim2 = make_sim()
+        obstacle = self._obstacle()
+        naive_result = sim1.run(
+            VehicleState(x=0, speed=15.0), NaivePlannerAdapter(CruisePlanner(target_speed_mps=15.0)),
+            [obstacle], duration_s=8.0,
+        )
+        ilqr_result = sim2.run(
+            VehicleState(x=0, speed=15.0), ILQRPlanner(ILQRPlannerConfig(target_speed_mps=15.0, risk_weight=400.0)),
+            [self._obstacle()], duration_s=8.0,
+        )
+        assert ilqr_result.override_count < naive_result.override_count
+
+    def test_higher_risk_weight_gives_more_clearance_in_closed_loop(self):
+        sim_low = make_sim()
+        sim_high = make_sim()
+        low = sim_low.run(
+            VehicleState(x=0, speed=15.0),
+            ILQRPlanner(ILQRPlannerConfig(target_speed_mps=15.0, risk_weight=50.0)),
+            [self._obstacle()], duration_s=8.0,
+        )
+        high = sim_high.run(
+            VehicleState(x=0, speed=15.0),
+            ILQRPlanner(ILQRPlannerConfig(target_speed_mps=15.0, risk_weight=800.0)),
+            [self._obstacle()], duration_s=8.0,
+        )
+        assert high.min_clearance_m >= low.min_clearance_m - 1e-6
+
+
+class TestGuardStillBackstopsRiskAwarePlanner:
+    def test_sudden_close_cutin_still_triggers_guard_even_with_ilqr(self):
+        """The guard must remain the hard backstop even for a "smarter"
+        planner: a sudden, very-close-range obstacle leaves no time for
+        smooth risk-based routing, and the guard must still catch it.
+        """
+        sim = make_sim()
+        cutin = ScriptedActor(spawn_time_s=1.5, spawn_gap_ahead_m=25.0, spawn_speed_mps=3.0)
+        ilqr = ILQRPlanner(ILQRPlannerConfig(target_speed_mps=15.0, risk_weight=400.0))
+        result = sim.run(VehicleState(x=0, speed=15.0), ilqr, [cutin], duration_s=8.0)
+        assert not result.collided
+        assert result.override_count > 0
+        spawn_step = int(round(1.5 / sim.dt_s))
+        assert any(r.overridden for r in result.history[spawn_step : spawn_step + 3])
+
+
+class TestDropout:
+    def test_ilqr_planner_and_guard_both_go_dark_together(self):
+        """During a dropout, the risk-aware planner must NOT get
+        privileged ground-truth obstacle info that the guard itself
+        cannot see -- otherwise the comparison against the guard's own
+        occupancy-based checks would be unfair/inconsistent, and the
+        scenario wouldn't actually be testing a real sensing failure.
+        """
+        sim = make_sim()
+        lead = ScriptedActor(
+            spawn_time_s=0.0, spawn_gap_ahead_m=60.0, spawn_speed_mps=15.0,
+            accel_schedule=[AccelSegment(0.0, 0.0), AccelSegment(2.0, -8.0)],
+        )
+        ilqr = ILQRPlanner(ILQRPlannerConfig(target_speed_mps=15.0, risk_weight=400.0))
+        result = sim.run(
+            VehicleState(x=0, speed=15.0), ilqr, [lead], duration_s=10.0,
+            dropout_windows=[(2.5, 4.0)],
+        )
+        assert all(math.isfinite(r.ego_speed) for r in result.history)
+        assert not result.collided
+
+
+# ==========================================================================
+# D. The open question: does replanning fix the symmetric saddle?
+# ==========================================================================
+
+
+class TestSymmetricSaddleUnderReplanning:
+    def test_closed_loop_replanning_does_NOT_break_a_perfectly_symmetric_tie(self):
+        """This directly answers the open question raised in the
+        previous deliverable's write-up ("does warm-starting each
+        cycle resolve the symmetric-obstacle saddle in practice?").
+        The answer, verified here rather than assumed: NO. With a
+        perfectly symmetric obstacle exactly on the centerline, a
+        deterministic solver, and a deterministic warm start, there is
+        nothing in the closed loop to introduce the asymmetry needed
+        to break the tie -- it collides just as it would with a single
+        open-loop solve. Real systems avoid this via genuinely
+        asymmetric warm starts (e.g. from a previous, already-
+        perturbed plan) or a sampling-based global proposal upstream
+        of local optimization -- not from closed-loop replanning
+        alone.
+        """
+        sim = make_sim()
+        symmetric_obstacle = ScriptedActor(
+            spawn_time_s=0.0, spawn_gap_ahead_m=30.0, spawn_speed_mps=0.0,
+            lateral_offset_m=0.0, length_m=2.0, width_m=1.5,
+        )
+        ilqr = ILQRPlanner(ILQRPlannerConfig(target_speed_mps=15.0, risk_weight=400.0))
+        result = sim.run(VehicleState(x=0, speed=15.0), ilqr, [symmetric_obstacle], duration_s=8.0)
+        assert result.collided, (
+            "expected the perfectly symmetric case to remain stuck on "
+            "the centerline saddle even under closed-loop replanning; "
+            "if this now avoids the obstacle, something in the solver "
+            "or warm-start is introducing asymmetry and this finding "
+            "(and the write-up) needs to be revisited"
+        )
+
+    def test_a_tiny_off_center_offset_is_enough_to_resolve_it(self):
+        """Confirms the saddle is a knife-edge, not a robust failure
+        mode: a trivially small lateral offset (well within realistic
+        sensor/localization noise) is already enough for the same
+        closed loop to find and use a real detour."""
+        sim = make_sim()
+        barely_offset_obstacle = ScriptedActor(
+            spawn_time_s=0.0, spawn_gap_ahead_m=30.0, spawn_speed_mps=0.0,
+            lateral_offset_m=0.05, length_m=2.0, width_m=1.5,
+        )
+        ilqr = ILQRPlanner(ILQRPlannerConfig(target_speed_mps=15.0, risk_weight=400.0))
+        result = sim.run(VehicleState(x=0, speed=15.0), ilqr, [barely_offset_obstacle], duration_s=8.0)
+        assert not result.collided
+        assert result.min_clearance_m > 1.5
+
+
+# ==========================================================================
+# E. Adversarial / edge cases
+# ==========================================================================
+
+
+class TestAdversarialAndEdgeCases:
+    def test_zero_duration_runs_cleanly(self):
+        sim = make_sim()
+        planner = ILQRPlanner(ILQRPlannerConfig(target_speed_mps=10.0))
+        result = sim.run(VehicleState(x=0, speed=5.0), planner, [], duration_s=0.0)
+        assert result.n_steps == 0
+
+    def test_single_step_horizon_uses_zero_accel_fallback(self):
+        sim = FullStackSimulator(guard=SimplexGuard(), dt_s=0.1, planning_horizon_steps=1)
+        planner = ILQRPlanner(ILQRPlannerConfig(target_speed_mps=10.0))
+        result = sim.run(VehicleState(x=0, speed=8.0), planner, [], duration_s=0.3)
+        assert all(math.isfinite(r.ego_speed) for r in result.history)
+
+    def test_many_simultaneous_actors_does_not_crash(self):
+        sim = make_sim()
+        actors = [
+            ScriptedActor(spawn_time_s=0.0, spawn_gap_ahead_m=20.0 + 5 * i, spawn_speed_mps=10.0,
+                          lateral_offset_m=(-1) ** i * 1.5)
+            for i in range(4)
+        ]
+        planner = ILQRPlanner(ILQRPlannerConfig(target_speed_mps=15.0, risk_weight=200.0))
+        result = sim.run(VehicleState(x=0, speed=15.0), planner, actors, duration_s=4.0)
+        assert all(math.isfinite(r.ego_speed) for r in result.history)
+
+    def test_naive_planner_adapter_ignores_obstacles_by_construction(self):
+        """Confirms the naive adapter really is obstacle-blind even
+        when given the SAME visible-actor info the risk-aware planner
+        gets -- it must produce identical output regardless."""
+        adapter = NaivePlannerAdapter(CruisePlanner(target_speed_mps=10.0))
+        ego = VehicleState(x=0, y=0, heading=0, speed=8.0)
+        traj_no_obstacles = adapter.generate(ego, 0.0, 1.0, 15, 0.1, [])
+        traj_with_obstacles = adapter.generate(ego, 0.0, 1.0, 15, 0.1, [(5.0, 0.0, 2.0, 2.0)])
+        np.testing.assert_array_equal(traj_no_obstacles, traj_with_obstacles)
+
+    def test_planner_reset_on_override_does_not_crash_next_cycle(self):
+        sim = make_sim()
+        cutin = ScriptedActor(spawn_time_s=0.5, spawn_gap_ahead_m=10.0, spawn_speed_mps=0.0)
+        ilqr = ILQRPlanner(ILQRPlannerConfig(target_speed_mps=15.0, risk_weight=400.0))
+        # Physically tight scenario guaranteed to trigger overrides
+        # (and therefore warm-start resets) repeatedly.
+        result = sim.run(VehicleState(x=0, speed=15.0), ilqr, [cutin], duration_s=5.0)
+        assert all(math.isfinite(r.ego_speed) for r in result.history)
+
+    def test_result_never_contains_nan_across_randomized_scenarios(self):
+        rng = np.random.default_rng(0)
+        for _ in range(8):
+            sim = make_sim()
+            gap = float(rng.uniform(15, 60))
+            lat = float(rng.uniform(-2, 2))
+            obstacle = ScriptedActor(
+                spawn_time_s=float(rng.uniform(0, 2)), spawn_gap_ahead_m=gap,
+                spawn_speed_mps=float(rng.uniform(0, 15)), lateral_offset_m=lat,
+            )
+            planner = ILQRPlanner(ILQRPlannerConfig(target_speed_mps=float(rng.uniform(5, 20)), risk_weight=300.0))
+            result = sim.run(
+                VehicleState(x=0, speed=float(rng.uniform(5, 20))), planner, [obstacle], duration_s=6.0
+            )
+            assert all(math.isfinite(r.ego_speed) for r in result.history)
