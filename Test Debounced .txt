@@ -1,0 +1,366 @@
+"""
+test_debounced_simplex_guard.py
+-----------------------------------
+Test groups:
+
+  A. THE headline fix: a single spurious "clear" reading no longer
+     releases the hold-over immediately (contrasted directly against
+     the previous deliverable's un-debounced StatefulSimplexGuard,
+     which does release on one frame).
+  B. Confirmation-streak mechanics: sustained clear readings do
+     eventually release; a dropout mid-streak resets the streak to
+     zero (design decision 1); a re-confirmed hazard resets the streak
+     too; the guard continues actively braking during the
+     unconfirmed window, not just delaying an internal label (design
+     decision 2).
+  C. Interaction with escalation: regaining real (but unconfirmed-
+     clear) data during ESCALATED drops back to HOLDING, not
+     immediately to IDLE and not staying ESCALATED (design decision
+     3).
+  D. Regression: the previous deliverable's headline closed-loop
+     scenario still avoids collision under the debounced guard, and
+     hazard-free scenarios remain fully transparent.
+  E. Adversarial / edge cases.
+"""
+
+import math
+
+import numpy as np
+import pytest
+
+from debounced_simplex_guard import DebouncedSimplexGuard
+from stateful_simplex_guard import HoldOverState, StatefulSimplexGuard
+from simplex_guard import FallbackMode, SimplexGuard, ViolationType
+from full_stack_integration import FullStackSimulator, NaivePlannerAdapter
+from closed_loop_sim import CruisePlanner, ScriptedActor, VehicleState
+
+
+# ==========================================================================
+# Helpers
+# ==========================================================================
+
+
+def flat_traj(speed, curvature=0.0, T=20, dt=0.1):
+    traj = np.zeros((T, 5))
+    x = 0.0
+    for t in range(T):
+        traj[t] = [x, 0.0, 0.0, speed, curvature]
+        x += speed * dt
+    return traj
+
+
+def occupancy_with_obstacle_ahead(distance_m, resolution=0.5, size=401):
+    grid = np.zeros((size, size), dtype=bool)
+    origin = size // 2
+    col = origin + int(round(distance_m / resolution))
+    grid[origin - 2 : origin + 3, col] = True
+    return grid, (origin, origin), resolution
+
+
+def empty_occupancy(size=401):
+    return np.zeros((size, size), dtype=bool)
+
+
+def capture_hazard(guard, distance_m=20.0, speed=15.0):
+    """Runs one real-data cycle that captures a proximity hazard into
+    HOLDING, and returns the (traj, ego) used, for reuse."""
+    traj = flat_traj(speed)
+    ego = np.array([0, 0, 0, speed, 0.0])
+    occ, origin, res = occupancy_with_obstacle_ahead(distance_m)
+    guard.check_and_override(traj, ego, occ, dt_s=0.1, resolution_m=res, occupancy_origin=origin)
+    return traj, ego
+
+
+# ==========================================================================
+# A. The headline fix
+# ==========================================================================
+
+
+class TestHeadlineFix:
+    def test_old_stateful_guard_releases_on_a_single_spurious_clear_frame(self):
+        """Sanity check establishing the gap this deliverable closes:
+        the PREVIOUS deliverable's guard really does release
+        immediately on one clear reading."""
+        guard = StatefulSimplexGuard(hold_over_grace_s=1.5)
+        traj, ego = capture_hazard(guard)
+        assert guard.state == HoldOverState.HOLDING
+
+        decision, safe_traj, overridden = guard.check_and_override(traj, ego, empty_occupancy(), dt_s=0.1)
+        assert guard.state == HoldOverState.IDLE
+        assert not overridden
+
+    def test_new_debounced_guard_does_not_release_on_a_single_spurious_clear_frame(self):
+        guard = DebouncedSimplexGuard(hold_over_grace_s=1.5, release_confirmation_s=0.5)
+        traj, ego = capture_hazard(guard)
+        assert guard.state == HoldOverState.HOLDING
+
+        decision, safe_traj, overridden = guard.check_and_override(traj, ego, empty_occupancy(), dt_s=0.1)
+        assert guard.state == HoldOverState.HOLDING
+        assert overridden
+        assert decision.fallback_mode in (FallbackMode.COMFORT_STOP, FallbackMode.EMERGENCY_STOP)
+
+    def test_debounced_guard_actively_brakes_during_unconfirmed_window_not_just_labels(self):
+        """Design decision 2: the returned TRAJECTORY, not just the
+        internal state label, must still reflect active braking
+        during the unconfirmed window."""
+        guard = DebouncedSimplexGuard(hold_over_grace_s=1.5, release_confirmation_s=0.5)
+        traj, ego = capture_hazard(guard, speed=15.0)
+        decision, safe_traj, overridden = guard.check_and_override(traj, ego, empty_occupancy(), dt_s=0.1)
+        assert overridden
+        # A real braking trajectory: speed decreasing across the horizon.
+        assert safe_traj[-1, 3] < safe_traj[0, 3]
+        assert safe_traj[0, 3] == pytest.approx(15.0)  # anchored to current speed
+
+
+# ==========================================================================
+# B. Confirmation-streak mechanics
+# ==========================================================================
+
+
+class TestConfirmationStreak:
+    def test_sustained_clear_readings_eventually_release(self):
+        guard = DebouncedSimplexGuard(hold_over_grace_s=1.5, release_confirmation_s=0.5)
+        traj, ego = capture_hazard(guard)
+        overridden_history = []
+        for _ in range(6):
+            d, st, ov = guard.check_and_override(traj, ego, empty_occupancy(), dt_s=0.1)
+            overridden_history.append(ov)
+        assert guard.state == HoldOverState.IDLE
+        # First few cycles still overridden (unconfirmed), later ones released.
+        assert overridden_history[0] is True
+        assert overridden_history[-1] is False
+
+    def test_release_happens_at_the_configured_threshold_not_earlier(self):
+        guard = DebouncedSimplexGuard(hold_over_grace_s=1.5, release_confirmation_s=0.5)
+        traj, ego = capture_hazard(guard)
+        for i in range(4):  # 0.4s total, still short of 0.5s
+            d, st, ov = guard.check_and_override(traj, ego, empty_occupancy(), dt_s=0.1)
+            assert guard.state == HoldOverState.HOLDING, f"released too early at cycle {i}"
+        d, st, ov = guard.check_and_override(traj, ego, empty_occupancy(), dt_s=0.1)  # 0.5s total
+        assert guard.state == HoldOverState.IDLE
+
+    def test_dropout_mid_streak_resets_the_streak_to_zero(self):
+        guard = DebouncedSimplexGuard(hold_over_grace_s=1.5, release_confirmation_s=0.5)
+        traj, ego = capture_hazard(guard)
+        for _ in range(3):
+            guard.check_and_override(traj, ego, empty_occupancy(), dt_s=0.1)
+        assert guard.clear_streak_s == pytest.approx(0.3)
+
+        guard.check_and_override(traj, ego, None, dt_s=0.1)  # a real dropout interrupts
+        assert guard.clear_streak_s == 0.0
+        assert guard.state == HoldOverState.HOLDING  # still holding, just streak reset
+
+    def test_streak_does_not_carry_across_a_dropout_to_reach_release_early(self):
+        """0.3s clear + a dropout + 0.3s more clear must NOT sum to
+        0.6s and release -- the dropout must genuinely reset it."""
+        guard = DebouncedSimplexGuard(hold_over_grace_s=1.5, release_confirmation_s=0.5)
+        traj, ego = capture_hazard(guard)
+        for _ in range(3):
+            guard.check_and_override(traj, ego, empty_occupancy(), dt_s=0.1)
+        guard.check_and_override(traj, ego, None, dt_s=0.1)
+        for _ in range(3):
+            d, st, ov = guard.check_and_override(traj, ego, empty_occupancy(), dt_s=0.1)
+        assert guard.state == HoldOverState.HOLDING  # only 0.3s since the reset, not released
+
+    def test_reconfirmed_hazard_resets_the_streak(self):
+        guard = DebouncedSimplexGuard(hold_over_grace_s=1.5, release_confirmation_s=0.5)
+        traj, ego = capture_hazard(guard)
+        for _ in range(3):
+            guard.check_and_override(traj, ego, empty_occupancy(), dt_s=0.1)
+        assert guard.clear_streak_s > 0.0
+
+        # A real reading reconfirms the hazard is still there.
+        occ, origin, res = occupancy_with_obstacle_ahead(15.0)
+        guard.check_and_override(traj, ego, occ, dt_s=0.1, resolution_m=res, occupancy_origin=origin)
+        assert guard.clear_streak_s == 0.0
+        assert guard.state == HoldOverState.HOLDING
+
+
+# ==========================================================================
+# C. Interaction with escalation
+# ==========================================================================
+
+
+class TestEscalationInteraction:
+    def test_regaining_data_during_escalation_drops_to_holding_not_idle(self):
+        guard = DebouncedSimplexGuard(hold_over_grace_s=0.2, release_confirmation_s=0.5)
+        traj, ego = capture_hazard(guard, distance_m=25.0)
+        for _ in range(5):  # exceed the 0.2s grace
+            guard.check_and_override(traj, ego, None, dt_s=0.1)
+        assert guard.state == HoldOverState.ESCALATED
+
+        decision, safe_traj, overridden = guard.check_and_override(traj, ego, empty_occupancy(), dt_s=0.1)
+        assert guard.state == HoldOverState.HOLDING  # not IDLE, not still ESCALATED
+        assert overridden
+        assert decision.fallback_mode == FallbackMode.COMFORT_STOP  # back to originally captured severity
+
+    def test_regaining_data_during_escalation_does_not_release_immediately(self):
+        guard = DebouncedSimplexGuard(hold_over_grace_s=0.2, release_confirmation_s=0.5)
+        traj, ego = capture_hazard(guard, distance_m=25.0)
+        for _ in range(5):
+            guard.check_and_override(traj, ego, None, dt_s=0.1)
+        assert guard.state == HoldOverState.ESCALATED
+
+        decision, _, overridden = guard.check_and_override(traj, ego, empty_occupancy(), dt_s=0.1)
+        assert overridden  # even though this reading says clear, not yet confirmed
+
+    def test_escalation_can_still_occur_after_dropping_back_from_escalated(self):
+        """If, after dropping ESCALATED->HOLDING on one real reading,
+        sensing drops out AGAIN before confirmation completes, the
+        elapsed-without-data clock must resume counting toward a fresh
+        escalation (not be stuck thinking it's already 'used up')."""
+        guard = DebouncedSimplexGuard(hold_over_grace_s=0.2, release_confirmation_s=0.5)
+        traj, ego = capture_hazard(guard, distance_m=25.0)
+        for _ in range(5):
+            guard.check_and_override(traj, ego, None, dt_s=0.1)
+        assert guard.state == HoldOverState.ESCALATED
+        guard.check_and_override(traj, ego, empty_occupancy(), dt_s=0.1)
+        assert guard.state == HoldOverState.HOLDING
+
+        for _ in range(5):
+            d, st, ov = guard.check_and_override(traj, ego, None, dt_s=0.1)
+        assert guard.state == HoldOverState.ESCALATED
+        assert d.fallback_mode == FallbackMode.EMERGENCY_STOP
+
+
+# ==========================================================================
+# D. Regression
+# ==========================================================================
+
+
+def make_scenario_lead():
+    return ScriptedActor(spawn_time_s=0.5, spawn_gap_ahead_m=45.0, spawn_speed_mps=0.0)
+
+
+class TestRegression:
+    def test_previous_deliverables_headline_scenario_still_avoids_collision(self):
+        sim = FullStackSimulator(
+            guard=DebouncedSimplexGuard(hold_over_grace_s=1.5, release_confirmation_s=0.5),
+            dt_s=0.1, planning_horizon_steps=20,
+        )
+        naive = NaivePlannerAdapter(CruisePlanner(target_speed_mps=15.0))
+        result = sim.run(
+            VehicleState(x=0, speed=15.0), naive, [make_scenario_lead()],
+            duration_s=8.0, dropout_windows=[(0.7, 1.7)],
+        )
+        assert not result.collided
+        assert result.min_clearance_m > 0.5
+
+    def test_clear_road_with_dropout_remains_fully_transparent(self):
+        sim_stateless = FullStackSimulator(guard=SimplexGuard(), dt_s=0.1, planning_horizon_steps=20)
+        sim_debounced = FullStackSimulator(
+            guard=DebouncedSimplexGuard(hold_over_grace_s=1.5, release_confirmation_s=0.5),
+            dt_s=0.1, planning_horizon_steps=20,
+        )
+        naive1 = NaivePlannerAdapter(CruisePlanner(target_speed_mps=15.0))
+        naive2 = NaivePlannerAdapter(CruisePlanner(target_speed_mps=15.0))
+        r1 = sim_stateless.run(VehicleState(x=0, speed=10.0), naive1, [], duration_s=6.0, dropout_windows=[(1.0, 2.0)])
+        r2 = sim_debounced.run(VehicleState(x=0, speed=10.0), naive2, [], duration_s=6.0, dropout_windows=[(1.0, 2.0)])
+        assert r1.collided == r2.collided == False
+        assert r1.override_count == r2.override_count == 0
+        for a, b in zip(r1.history, r2.history):
+            assert a.ego_speed == pytest.approx(b.ego_speed)
+
+    def test_no_confirmation_delay_when_release_confirmation_s_is_zero(self):
+        """release_confirmation_s=0 must reproduce the previous
+        deliverable's immediate-release behavior exactly -- a useful
+        explicit escape hatch, and a good consistency check."""
+        guard = DebouncedSimplexGuard(hold_over_grace_s=1.5, release_confirmation_s=0.0)
+        traj, ego = capture_hazard(guard)
+        decision, safe_traj, overridden = guard.check_and_override(traj, ego, empty_occupancy(), dt_s=0.1)
+        assert guard.state == HoldOverState.IDLE
+        assert not overridden
+
+
+# ==========================================================================
+# E. Adversarial / edge cases
+# ==========================================================================
+
+
+class TestAdversarialAndEdgeCases:
+    def test_negative_release_confirmation_rejected(self):
+        with pytest.raises(ValueError):
+            DebouncedSimplexGuard(release_confirmation_s=-0.1)
+
+    def test_reset_clears_streak_too(self):
+        guard = DebouncedSimplexGuard(release_confirmation_s=0.5)
+        traj, ego = capture_hazard(guard)
+        guard.check_and_override(traj, ego, empty_occupancy(), dt_s=0.1)
+        assert guard.clear_streak_s > 0.0
+        guard.reset()
+        assert guard.clear_streak_s == 0.0
+        assert guard.state == HoldOverState.IDLE
+
+    def test_invalid_sensor_input_during_confirmation_window_does_not_advance_streak(self):
+        guard = DebouncedSimplexGuard(hold_over_grace_s=1.5, release_confirmation_s=0.5)
+        traj, ego = capture_hazard(guard)
+        guard.check_and_override(traj, ego, empty_occupancy(), dt_s=0.1)
+        streak_before = guard.clear_streak_s
+
+        bad_ego = np.array([0, 0, 0, float("nan"), 0.0])
+        decision, safe_traj, overridden = guard.check_and_override(traj, bad_ego, empty_occupancy(), dt_s=0.1)
+        assert overridden
+        assert decision.fallback_mode == FallbackMode.EMERGENCY_STOP
+        assert guard.clear_streak_s == streak_before  # untouched by garbage data
+
+    def test_dropout_with_no_prior_hazard_is_still_pure_passthrough(self):
+        guard = DebouncedSimplexGuard(release_confirmation_s=0.5)
+        traj = flat_traj(10.0)
+        ego = np.array([0, 0, 0, 10.0, 0.0])
+        decision, safe_traj, overridden = guard.check_and_override(traj, ego, None, dt_s=0.1)
+        assert not overridden
+        assert guard.state == HoldOverState.IDLE
+        assert guard.clear_streak_s == 0.0
+
+    def test_result_never_contains_nan_across_randomized_flicker_scenarios(self):
+        rng = np.random.default_rng(0)
+        for _ in range(6):
+            guard = DebouncedSimplexGuard(
+                hold_over_grace_s=float(rng.uniform(0.2, 2.0)),
+                release_confirmation_s=float(rng.uniform(0.0, 1.0)),
+            )
+            traj, ego = capture_hazard(guard, distance_m=float(rng.uniform(15, 35)), speed=float(rng.uniform(5, 20)))
+            for _ in range(20):
+                if rng.random() < 0.3:
+                    d, st, ov = guard.check_and_override(traj, ego, None, dt_s=0.1)
+                else:
+                    d, st, ov = guard.check_and_override(traj, ego, empty_occupancy(), dt_s=0.1)
+                assert np.all(np.isfinite(st))
+
+    def test_very_large_release_confirmation_never_releases_within_a_short_run(self):
+        guard = DebouncedSimplexGuard(hold_over_grace_s=1.5, release_confirmation_s=1000.0)
+        traj, ego = capture_hazard(guard)
+        for _ in range(20):
+            d, st, ov = guard.check_and_override(traj, ego, empty_occupancy(), dt_s=0.1)
+        assert guard.state != HoldOverState.IDLE
+
+    def test_live_lateral_violation_during_unconfirmed_window_is_not_downgraded(self):
+        """Directly exercises the defensive severity-merge branch: a
+        live, occupancy-independent lateral-accel violation that is
+        already at least as severe as the held (comfort-level) memory
+        must pass through as-is, not be replaced by the weaker held
+        response.
+        """
+        guard = DebouncedSimplexGuard(hold_over_grace_s=1.5, release_confirmation_s=0.5)
+        traj, ego = capture_hazard(guard, distance_m=25.0)  # soft TTC only -> COMFORT_STOP held
+        assert guard.held_fallback_mode == FallbackMode.COMFORT_STOP
+
+        # Clear occupancy this cycle, but the candidate trajectory now
+        # requests an unsafe corner -> live SPEED_LIMIT_CORNER, more
+        # severe than the held COMFORT_STOP.
+        corner_traj = flat_traj(25.0, curvature=0.05)
+        corner_ego = np.array([0, 0, 0, 25.0, 0.05])
+        decision, safe_traj, overridden = guard.check_and_override(corner_traj, corner_ego, empty_occupancy(), dt_s=0.1)
+        assert overridden
+        assert decision.fallback_mode == FallbackMode.SPEED_LIMIT_CORNER
+
+    def test_defensive_fallback_when_held_violations_invariant_broken_mid_confirmation(self):
+        """Same defensive-invariant check as the previous deliverable,
+        now for the debounced confirmation-window code path."""
+        guard = DebouncedSimplexGuard(hold_over_grace_s=1.5, release_confirmation_s=0.5)
+        traj, ego = capture_hazard(guard)
+        guard._held_violations = ()  # deliberately break the invariant
+        decision, safe_traj, overridden = guard.check_and_override(traj, ego, empty_occupancy(), dt_s=0.1)
+        assert overridden
+        assert len(decision.violations) > 0
+        assert np.all(np.isfinite(safe_traj))
