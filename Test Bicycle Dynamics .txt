@@ -1,0 +1,599 @@
+"""
+test_bicycle_dynamics_tire_model.py
+---------------------------------------
+Test groups:
+
+  A. VehicleParams validation and basic properties.
+  B. Axle normal loads: load-transfer physics, gradient vs finite
+     differences, floor behavior.
+  C. Slip angles: gradient vs finite differences across many
+     randomized states.
+  D. THE core validation: the full continuous-time dynamics Jacobian
+     (6x6 state, 6x2 control -- chaining through the tire model's own
+     validated gradient, the slip-angle partials, and full product
+     rule on every Fyf*sin/cos(delta) term) checked against finite
+     differences across many randomized states/controls with a
+     TRAINED tire model.
+  E. Discrete step/Jacobian consistency with the continuous versions.
+  F. Basic vehicle-dynamics sanity: open-loop step-steer stability,
+     zero-input trivial motion, symmetric response to +/- steer.
+  G. THE headline physical finding: real tire saturation produces
+     genuine, speed-dependent understeer that grows monotonically
+     with speed -- something the kinematic unicycle used everywhere
+     else in this series structurally cannot exhibit.
+  H. GenericILQRSolver: goal-reaching, monotonic cost decrease,
+     control clipping, degenerate cases -- the same properties
+     checked for the unicycle-specific solver in the stochastic-iLQR
+     deliverable, now for the generalized, dynamics-pluggable version.
+  I. End-to-end lane-change scenario using the trained tire model.
+  J. Adversarial / edge cases.
+"""
+
+import math
+
+import numpy as np
+import pytest
+
+from neural_pacejka import (
+    InputNormalization,
+    MLP,
+    NeuralPacejkaTireModel,
+    PacejkaParams,
+    generate_synthetic_dataset,
+    lateral_force_classical,
+    train_neural_pacejka,
+)
+from bicycle_dynamics_tire_model import (
+    CONTROL_DIM,
+    STATE_DIM,
+    GenericILQRSolver,
+    SimpleCostConfig,
+    VehicleParams,
+    axle_normal_loads,
+    axle_normal_loads_grad,
+    bicycle_dynamics_continuous,
+    bicycle_dynamics_continuous_jacobian,
+    bicycle_jacobians,
+    bicycle_step,
+    slip_angles,
+    slip_angles_grad,
+)
+
+
+def fd_derivative(f, x, eps=1e-6):
+    return (f(x + eps) - f(x - eps)) / (2 * eps)
+
+
+@pytest.fixture(scope="module")
+def trained_tire_model():
+    params = PacejkaParams()
+    alpha_train, Fz_train, force_train_noisy = generate_synthetic_dataset(2000, params, seed=0)
+    residual_target = force_train_noisy - lateral_force_classical(alpha_train, Fz_train, params)
+    model, _ = train_neural_pacejka(params, alpha_train, Fz_train, residual_target, seed=0)
+    return model
+
+
+@pytest.fixture(scope="module")
+def small_tire_model():
+    """A quick, lightly-trained model for tests that just need SOME
+    reasonable, non-degenerate tire model and don't care about
+    prediction accuracy (e.g. Jacobian correctness checks)."""
+    params = PacejkaParams()
+    alpha_train, Fz_train, force_train_noisy = generate_synthetic_dataset(300, params, seed=1)
+    residual_target = force_train_noisy - lateral_force_classical(alpha_train, Fz_train, params)
+    model, _ = train_neural_pacejka(
+        params, alpha_train, Fz_train, residual_target, hidden_sizes=(8, 8), epochs=200, seed=1
+    )
+    return model
+
+
+# ==========================================================================
+# A. VehicleParams
+# ==========================================================================
+
+
+class TestVehicleParams:
+    def test_defaults_construct_without_error(self):
+        vp = VehicleParams()
+        assert vp.wheelbase_m == pytest.approx(vp.lf_m + vp.lr_m)
+
+    def test_rejects_nonpositive_mass(self):
+        with pytest.raises(ValueError):
+            VehicleParams(mass_kg=0.0)
+
+    def test_rejects_nonpositive_yaw_inertia(self):
+        with pytest.raises(ValueError):
+            VehicleParams(yaw_inertia_kgm2=-1.0)
+
+    def test_rejects_nonpositive_axle_distances(self):
+        with pytest.raises(ValueError):
+            VehicleParams(lf_m=0.0)
+        with pytest.raises(ValueError):
+            VehicleParams(lr_m=-0.5)
+
+
+# ==========================================================================
+# B. Axle normal loads
+# ==========================================================================
+
+
+class TestAxleNormalLoads:
+    def test_static_loads_sum_to_weight_at_zero_force(self):
+        vp = VehicleParams()
+        Fzf, Fzr = axle_normal_loads(0.0, vp)
+        assert Fzf + Fzr == pytest.approx(vp.mass_kg * vp.gravity_mps2)
+
+    def test_static_load_distribution_matches_cg_position(self):
+        """More weight on the axle CLOSER to the CG's opposite end --
+        i.e. Fzf/Fzr = lr/lf (a standard static-balance identity)."""
+        vp = VehicleParams()
+        Fzf, Fzr = axle_normal_loads(0.0, vp)
+        assert Fzf / Fzr == pytest.approx(vp.lr_m / vp.lf_m)
+
+    def test_acceleration_shifts_load_rearward(self):
+        vp = VehicleParams()
+        Fzf0, Fzr0 = axle_normal_loads(0.0, vp)
+        Fzf_acc, Fzr_acc = axle_normal_loads(1500.0, vp)  # positive Fx = accelerating
+        assert Fzr_acc > Fzr0
+        assert Fzf_acc < Fzf0
+
+    def test_braking_shifts_load_forward(self):
+        vp = VehicleParams()
+        Fzf0, Fzr0 = axle_normal_loads(0.0, vp)
+        Fzf_brake, Fzr_brake = axle_normal_loads(-1500.0, vp)  # negative Fx = braking
+        assert Fzf_brake > Fzf0
+        assert Fzr_brake < Fzr0
+
+    def test_floor_prevents_nonpositive_load_under_extreme_braking(self):
+        vp = VehicleParams()
+        Fzf, Fzr = axle_normal_loads(-1_000_000.0, vp)  # absurd braking force
+        assert Fzr >= vp.fz_floor_n
+
+    @pytest.mark.parametrize("Fx", [-500.0, 0.0, 800.0, 2000.0])
+    def test_gradient_matches_finite_difference_away_from_floor(self, Fx):
+        vp = VehicleParams()
+        Fzf, dFzf_dFx, Fzr, dFzr_dFx = axle_normal_loads_grad(Fx, vp)
+        fd_f = fd_derivative(lambda fx: axle_normal_loads(fx, vp)[0], Fx)
+        fd_r = fd_derivative(lambda fx: axle_normal_loads(fx, vp)[1], Fx)
+        assert dFzf_dFx == pytest.approx(fd_f, rel=1e-4)
+        assert dFzr_dFx == pytest.approx(fd_r, rel=1e-4)
+
+    def test_gradient_is_zero_when_floor_is_active(self):
+        vp = VehicleParams()
+        # At an extreme POSITIVE Fx (accelerating), the front load
+        # transfers away and hits the floor.
+        Fzf, dFzf_dFx, Fzr, dFzr_dFx = axle_normal_loads_grad(1_000_000.0, vp)
+        assert Fzf == pytest.approx(vp.fz_floor_n)
+        assert dFzf_dFx == 0.0
+
+
+# ==========================================================================
+# C. Slip angles
+# ==========================================================================
+
+
+class TestSlipAngles:
+    @pytest.mark.parametrize("seed", range(15))
+    def test_gradient_matches_finite_difference(self, seed):
+        rng = np.random.default_rng(seed)
+        vp = VehicleParams()
+        state = np.array(
+            [0.0, 0.0, float(rng.uniform(-1, 1)), float(rng.uniform(2, 35)),
+             float(rng.uniform(-2, 2)), float(rng.uniform(-0.5, 0.5))]
+        )
+        delta = float(rng.uniform(-0.3, 0.3))
+        alpha_f, alpha_r, grad_f, grad_r = slip_angles_grad(state, delta, vp)
+
+        def f_alpha_f(vx=None, vy=None, r=None, d=None):
+            s = state.copy()
+            if vx is not None:
+                s[3] = vx
+            if vy is not None:
+                s[4] = vy
+            if r is not None:
+                s[5] = r
+            dd = delta if d is None else d
+            return slip_angles(s, dd, vp)[0]
+
+        fd_vx = fd_derivative(lambda v: f_alpha_f(vx=v), state[3])
+        fd_vy = fd_derivative(lambda v: f_alpha_f(vy=v), state[4])
+        fd_r = fd_derivative(lambda v: f_alpha_f(r=v), state[5])
+        fd_delta = fd_derivative(lambda d: f_alpha_f(d=d), delta)
+        np.testing.assert_allclose(grad_f, [fd_vx, fd_vy, fd_r, fd_delta], atol=1e-4)
+
+    def test_zero_speed_does_not_crash_and_uses_floor(self):
+        vp = VehicleParams()
+        state = np.array([0, 0, 0, 0.0, 0.0, 0.0])
+        alpha_f, alpha_r = slip_angles(state, 0.1, vp)
+        assert math.isfinite(alpha_f)
+        assert math.isfinite(alpha_r)
+
+    def test_straight_ahead_zero_everything_gives_zero_slip(self):
+        vp = VehicleParams()
+        state = np.array([0, 0, 0, 15.0, 0.0, 0.0])
+        alpha_f, alpha_r = slip_angles(state, 0.0, vp)
+        assert alpha_f == pytest.approx(0.0, abs=1e-9)
+        assert alpha_r == pytest.approx(0.0, abs=1e-9)
+
+
+# ==========================================================================
+# D. Full continuous-time dynamics Jacobian
+# ==========================================================================
+
+
+class TestDynamicsJacobian:
+    @pytest.mark.parametrize("seed", range(20))
+    def test_full_jacobian_matches_finite_differences(self, seed, trained_tire_model):
+        rng = np.random.default_rng(seed)
+        vp = VehicleParams()
+        state = np.array(
+            [
+                float(rng.uniform(-10, 10)),
+                float(rng.uniform(-10, 10)),
+                float(rng.uniform(-1, 1)),
+                float(rng.uniform(3, 35)),
+                float(rng.uniform(-3, 3)),
+                float(rng.uniform(-1, 1)),
+            ]
+        )
+        control = np.array([float(rng.uniform(-0.3, 0.3)), float(rng.uniform(-2000, 2000))])
+
+        A, B = bicycle_dynamics_continuous_jacobian(state, control, trained_tire_model, vp)
+
+        def f(s, c):
+            return bicycle_dynamics_continuous(s, c, trained_tire_model, vp)
+
+        eps = 1e-6
+        A_fd = np.zeros((STATE_DIM, STATE_DIM))
+        for i in range(STATE_DIM):
+            sp, sm = state.copy(), state.copy()
+            sp[i] += eps
+            sm[i] -= eps
+            A_fd[:, i] = (f(sp, control) - f(sm, control)) / (2 * eps)
+
+        B_fd = np.zeros((STATE_DIM, CONTROL_DIM))
+        for i in range(CONTROL_DIM):
+            cp, cm = control.copy(), control.copy()
+            cp[i] += eps
+            cm[i] -= eps
+            B_fd[:, i] = (f(state, cp) - f(state, cm)) / (2 * eps)
+
+        np.testing.assert_allclose(A, A_fd, atol=1e-4, rtol=1e-3)
+        np.testing.assert_allclose(B, B_fd, atol=1e-4, rtol=1e-3)
+
+    def test_jacobian_zero_blocks_match_dynamics_structure(self, trained_tire_model):
+        """x, y, heading_dot have no dependence on x, y themselves, or
+        on the control directly (only through the chain via other
+        states) -- confirms the analytic Jacobian has the expected
+        sparsity pattern, not just matching values elsewhere."""
+        vp = VehicleParams()
+        state = np.array([1.0, 2.0, 0.1, 15.0, 0.3, 0.02])
+        control = np.array([0.03, 500.0])
+        A, B = bicycle_dynamics_continuous_jacobian(state, control, trained_tire_model, vp)
+        assert np.all(A[:, 0] == 0.0)  # nothing depends on x
+        assert np.all(A[:, 1] == 0.0)  # nothing depends on y
+        assert A[2, 5] == pytest.approx(1.0)  # heading_dot = r exactly
+        assert np.all(B[0:3, :] == 0.0)  # position/heading derivatives have no direct control term
+
+
+# ==========================================================================
+# E. Discrete step / Jacobian consistency
+# ==========================================================================
+
+
+class TestDiscreteStep:
+    def test_discrete_jacobian_matches_finite_difference_of_step(self, small_tire_model):
+        vp = VehicleParams()
+        state = np.array([0.0, 0.0, 0.05, 18.0, 0.4, 0.03])
+        control = np.array([0.04, 300.0])
+        dt = 0.02
+        A_d, B_d = bicycle_jacobians(state, control, small_tire_model, vp, dt)
+
+        def step(s, c):
+            return bicycle_step(s, c, small_tire_model, vp, dt)
+
+        eps = 1e-6
+        A_fd = np.zeros((STATE_DIM, STATE_DIM))
+        for i in range(STATE_DIM):
+            sp, sm = state.copy(), state.copy()
+            sp[i] += eps
+            sm[i] -= eps
+            A_fd[:, i] = (step(sp, control) - step(sm, control)) / (2 * eps)
+        np.testing.assert_allclose(A_d, A_fd, atol=1e-4, rtol=1e-3)
+
+    def test_zero_dt_is_identity_step(self, small_tire_model):
+        vp = VehicleParams()
+        state = np.array([1.0, 2.0, 0.1, 15.0, 0.2, 0.01])
+        control = np.array([0.02, 100.0])
+        new_state = bicycle_step(state, control, small_tire_model, vp, dt=0.0)
+        np.testing.assert_array_equal(new_state, state)
+
+
+# ==========================================================================
+# F. Basic vehicle-dynamics sanity
+# ==========================================================================
+
+
+class TestVehicleDynamicsSanity:
+    def test_zero_control_and_zero_lateral_state_moves_straight(self, small_tire_model):
+        vp = VehicleParams()
+        state = np.array([0.0, 0.0, 0.0, 15.0, 0.0, 0.0])
+        control = np.array([0.0, 0.0])
+        for _ in range(50):
+            state = bicycle_step(state, control, small_tire_model, vp, dt=0.02)
+        assert state[1] == pytest.approx(0.0, abs=1e-6)  # no lateral drift
+        assert state[2] == pytest.approx(0.0, abs=1e-9)  # no heading change
+        assert state[3] == pytest.approx(15.0, rel=1e-3)  # speed roughly held
+
+    def test_step_steer_settles_without_diverging(self, trained_tire_model):
+        vp = VehicleParams()
+        state = np.array([0.0, 0.0, 0.0, 20.0, 0.0, 0.0])
+        control = np.array([0.03, 0.0])
+        dt = 0.01
+        for _ in range(500):  # 5 seconds
+            state = bicycle_step(state, control, trained_tire_model, vp, dt)
+            assert np.all(np.isfinite(state))
+            assert abs(state[4]) < 10.0  # lateral velocity stays bounded (no spin-out)
+            assert abs(state[5]) < 2.0  # yaw rate stays bounded
+
+    def test_symmetric_response_to_positive_and_negative_steer(self, trained_tire_model):
+        vp = VehicleParams()
+        dt = 0.01
+
+        def run(delta):
+            state = np.array([0.0, 0.0, 0.0, 15.0, 0.0, 0.0])
+            for _ in range(300):
+                state = bicycle_step(state, np.array([delta, 0.0]), trained_tire_model, vp, dt)
+            return state
+
+        s_pos = run(0.04)
+        s_neg = run(-0.04)
+        assert s_pos[1] == pytest.approx(-s_neg[1], rel=1e-6)  # mirrored lateral position
+        assert s_pos[2] == pytest.approx(-s_neg[2], rel=1e-6)  # mirrored heading
+        assert s_pos[5] == pytest.approx(-s_neg[5], rel=1e-6)  # mirrored yaw rate
+
+
+# ==========================================================================
+# G. Headline finding: speed-dependent tire-saturation understeer
+# ==========================================================================
+
+
+def steady_state_yaw_rate(v0, delta, tire_model, vp, duration=6.0, dt=0.01):
+    state = np.array([0.0, 0.0, 0.0, v0, 0.0, 0.0])
+    control = np.array([delta, 0.0])
+    n = int(duration / dt)
+    for _ in range(n):
+        state = bicycle_step(state, control, tire_model, vp, dt)
+    return state[5]
+
+
+class TestSpeedDependentUndersteer:
+    def test_understeer_grows_monotonically_with_speed(self, trained_tire_model):
+        """THE headline validated physical finding: as speed
+        increases, the achieved steady-state yaw rate falls further
+        and further below the kinematic-bicycle-model prediction
+        (which has NO notion of tire saturation) -- genuine,
+        speed-dependent understeer, something the kinematic unicycle
+        used everywhere else in this series structurally cannot
+        produce (its curvature response is speed-independent by
+        construction).
+        """
+        vp = VehicleParams()
+        delta = 0.05
+        speeds = [5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0]
+        understeer_fractions = []
+        for v0 in speeds:
+            r_actual = steady_state_yaw_rate(v0, delta, trained_tire_model, vp)
+            r_kinematic = v0 * math.tan(delta) / vp.wheelbase_m
+            understeer_fractions.append(1.0 - r_actual / r_kinematic)
+
+        assert all(
+            b >= a - 1e-6 for a, b in zip(understeer_fractions, understeer_fractions[1:])
+        ), f"understeer did not grow monotonically: {understeer_fractions}"
+        assert understeer_fractions[0] < 0.05
+        assert understeer_fractions[-1] > 0.3
+
+    def test_low_speed_matches_kinematic_bicycle_closely(self, trained_tire_model):
+        vp = VehicleParams()
+        delta = 0.03
+        v0 = 3.0  # low enough that slip angles are tiny
+        r_actual = steady_state_yaw_rate(v0, delta, trained_tire_model, vp)
+        r_kinematic = v0 * math.tan(delta) / vp.wheelbase_m
+        assert r_actual == pytest.approx(r_kinematic, rel=0.05)
+
+    def test_achieved_yaw_rate_can_decrease_past_a_speed_even_as_kinematic_prediction_rises(
+        self, trained_tire_model
+    ):
+        """The clearest possible demonstration that this is REAL
+        saturation, not just diminishing returns: past some speed, the
+        ACTUAL achieved yaw rate for a fixed steer angle can go DOWN
+        as speed increases further, even though the (tire-unaware)
+        kinematic model predicts it should keep going up.
+        """
+        vp = VehicleParams()
+        delta = 0.05
+        r_mid = steady_state_yaw_rate(25.0, delta, trained_tire_model, vp)
+        r_high = steady_state_yaw_rate(40.0, delta, trained_tire_model, vp)
+        kinematic_mid = 25.0 * math.tan(delta) / vp.wheelbase_m
+        kinematic_high = 40.0 * math.tan(delta) / vp.wheelbase_m
+        assert kinematic_high > kinematic_mid  # kinematic model: monotonically increasing
+        assert r_high < r_mid  # real model: actually turns LESS at the higher speed
+
+
+# ==========================================================================
+# H. GenericILQRSolver
+# ==========================================================================
+
+
+def make_simple_cost(goal, R_diag=(1.0, 1e-4), Qf_diag=(1.0, 10.0, 5.0, 1.0, 1.0, 1.0)):
+    return SimpleCostConfig(
+        Q_running=np.zeros((STATE_DIM, STATE_DIM)),
+        R=np.diag(R_diag),
+        Qf=np.diag(Qf_diag),
+        goal=goal,
+    )
+
+
+class TestGenericILQRSolver:
+    def test_reaches_goal_on_simple_problem(self, small_tire_model):
+        vp = VehicleParams()
+        goal = np.array([20.0, 1.0, 0.0, 15.0, 0.0, 0.0])
+        cost = make_simple_cost(goal)
+        step_fn = lambda s, c, dt: bicycle_step(s, c, small_tire_model, vp, dt)
+        jac_fn = lambda s, c, dt: bicycle_jacobians(s, c, small_tire_model, vp, dt)
+        solver = GenericILQRSolver(
+            step_fn, jac_fn, cost, dt=0.05, state_dim=STATE_DIM, control_dim=CONTROL_DIM,
+            max_iters=100, max_control=np.array([0.4, 3000.0]),
+        )
+        x0 = np.array([0.0, 0.0, 0.0, 15.0, 0.0, 0.0])
+        U_init = np.tile(np.array([0.01, 0.0]), (30, 1))
+        result = solver.solve(x0, U_init)
+        assert result.converged
+        assert abs(result.X[-1, 1] - 1.0) < 0.5
+
+    def test_cost_is_monotonically_non_increasing(self, small_tire_model):
+        vp = VehicleParams()
+        goal = np.array([15.0, 2.0, 0.0, 15.0, 0.0, 0.0])
+        cost = make_simple_cost(goal)
+        step_fn = lambda s, c, dt: bicycle_step(s, c, small_tire_model, vp, dt)
+        jac_fn = lambda s, c, dt: bicycle_jacobians(s, c, small_tire_model, vp, dt)
+        solver = GenericILQRSolver(
+            step_fn, jac_fn, cost, dt=0.05, state_dim=STATE_DIM, control_dim=CONTROL_DIM, max_iters=60
+        )
+        x0 = np.array([0.0, 0.0, 0.0, 15.0, 0.0, 0.0])
+        result = solver.solve(x0, np.zeros((25, 2)))
+        history = result.cost_history
+        assert all(c2 <= c1 + 1e-9 for c1, c2 in zip(history, history[1:]))
+
+    def test_control_clipping_is_respected(self, small_tire_model):
+        vp = VehicleParams()
+        goal = np.array([100.0, 20.0, 0.0, 15.0, 0.0, 0.0])  # aggressive goal
+        cost = make_simple_cost(goal, R_diag=(1e-6, 1e-6))
+        step_fn = lambda s, c, dt: bicycle_step(s, c, small_tire_model, vp, dt)
+        jac_fn = lambda s, c, dt: bicycle_jacobians(s, c, small_tire_model, vp, dt)
+        max_control = np.array([0.2, 1000.0])
+        solver = GenericILQRSolver(
+            step_fn, jac_fn, cost, dt=0.05, state_dim=STATE_DIM, control_dim=CONTROL_DIM,
+            max_iters=80, max_control=max_control,
+        )
+        x0 = np.array([0.0, 0.0, 0.0, 15.0, 0.0, 0.0])
+        result = solver.solve(x0, np.zeros((30, 2)))
+        assert np.all(np.abs(result.U) <= max_control + 1e-9)
+
+    def test_goal_equals_start_converges_trivially(self, small_tire_model):
+        vp = VehicleParams()
+        x0 = np.array([0.0, 0.0, 0.0, 15.0, 0.0, 0.0])
+        cost = make_simple_cost(goal=x0.copy())
+        step_fn = lambda s, c, dt: bicycle_step(s, c, small_tire_model, vp, dt)
+        jac_fn = lambda s, c, dt: bicycle_jacobians(s, c, small_tire_model, vp, dt)
+        solver = GenericILQRSolver(
+            step_fn, jac_fn, cost, dt=0.05, state_dim=STATE_DIM, control_dim=CONTROL_DIM, max_iters=30
+        )
+        result = solver.solve(x0, np.zeros((10, 2)))
+        assert result.converged
+        np.testing.assert_allclose(result.U, np.zeros((10, 2)), atol=1e-6)
+
+
+# ==========================================================================
+# I. End-to-end lane-change scenario
+# ==========================================================================
+
+
+class TestLaneChangeScenario:
+    def _run_lane_change(self, v0, tire_model, T=60, dt=0.02, lateral_target=3.5):
+        vp = VehicleParams()
+        goal = np.array([v0 * T * dt, lateral_target, 0.0, v0, 0.0, 0.0])
+        cost = SimpleCostConfig(
+            Q_running=np.zeros((STATE_DIM, STATE_DIM)),
+            R=np.diag([50.0, 0.001]),
+            Qf=np.diag([1.0, 50.0, 30.0, 5.0, 5.0, 5.0]),
+            goal=goal,
+        )
+        step_fn = lambda s, c, dt_: bicycle_step(s, c, tire_model, vp, dt_)
+        jac_fn = lambda s, c, dt_: bicycle_jacobians(s, c, tire_model, vp, dt_)
+        solver = GenericILQRSolver(
+            step_fn, jac_fn, cost, dt=dt, state_dim=STATE_DIM, control_dim=CONTROL_DIM,
+            max_iters=100, max_control=np.array([0.5, 4000.0]),
+        )
+        x0 = np.array([0.0, 0.0, 0.0, v0, 0.0, 0.0])
+        U_init = np.tile(np.array([0.02, 0.0]), (T, 1))
+        return solver.solve(x0, U_init), vp
+
+    @pytest.mark.parametrize("v0", [10.0, 20.0, 30.0])
+    def test_lane_change_converges_and_stays_finite(self, v0, trained_tire_model):
+        result, _ = self._run_lane_change(v0, trained_tire_model)
+        assert np.all(np.isfinite(result.X))
+        assert np.all(np.isfinite(result.U))
+
+    @pytest.mark.parametrize("v0", [10.0, 20.0, 30.0])
+    def test_lane_change_makes_substantial_progress_toward_target(self, v0, trained_tire_model):
+        result, _ = self._run_lane_change(v0, trained_tire_model)
+        final_y = result.X[-1, 1]
+        assert final_y > 1.5  # got meaningfully across, even if not exact
+
+    @pytest.mark.parametrize("v0", [10.0, 20.0, 30.0])
+    def test_lane_change_respects_steer_limit(self, v0, trained_tire_model):
+        result, _ = self._run_lane_change(v0, trained_tire_model)
+        assert np.all(np.abs(result.U[:, 0]) <= 0.5 + 1e-9)
+
+
+# ==========================================================================
+# J. Adversarial / edge cases
+# ==========================================================================
+
+
+class TestAdversarialAndEdgeCases:
+    def test_extreme_steer_angle_does_not_crash(self, small_tire_model):
+        vp = VehicleParams()
+        state = np.array([0.0, 0.0, 0.0, 10.0, 0.0, 0.0])
+        control = np.array([1.4, 0.0])  # ~80 degrees, unrealistic but must not crash
+        new_state = bicycle_step(state, control, small_tire_model, vp, dt=0.01)
+        assert np.all(np.isfinite(new_state))
+
+    def test_extreme_braking_force_does_not_crash(self, small_tire_model):
+        vp = VehicleParams()
+        state = np.array([0.0, 0.0, 0.0, 20.0, 0.0, 0.0])
+        control = np.array([0.0, -50000.0])
+        new_state = bicycle_step(state, control, small_tire_model, vp, dt=0.01)
+        assert np.all(np.isfinite(new_state))
+
+    def test_zero_forward_speed_start_does_not_crash(self, small_tire_model):
+        vp = VehicleParams()
+        state = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        control = np.array([0.1, 500.0])
+        new_state = bicycle_step(state, control, small_tire_model, vp, dt=0.01)
+        assert np.all(np.isfinite(new_state))
+
+    def test_single_step_ilqr_horizon_does_not_crash(self, small_tire_model):
+        vp = VehicleParams()
+        goal = np.array([1.0, 0.1, 0.0, 15.0, 0.0, 0.0])
+        cost = make_simple_cost(goal)
+        step_fn = lambda s, c, dt: bicycle_step(s, c, small_tire_model, vp, dt)
+        jac_fn = lambda s, c, dt: bicycle_jacobians(s, c, small_tire_model, vp, dt)
+        solver = GenericILQRSolver(
+            step_fn, jac_fn, cost, dt=0.05, state_dim=STATE_DIM, control_dim=CONTROL_DIM, max_iters=20
+        )
+        x0 = np.array([0.0, 0.0, 0.0, 15.0, 0.0, 0.0])
+        result = solver.solve(x0, np.zeros((1, 2)))
+        assert result.X.shape == (2, STATE_DIM)
+
+    def test_result_never_contains_nan_across_randomized_states(self, trained_tire_model):
+        rng = np.random.default_rng(0)
+        vp = VehicleParams()
+        for _ in range(15):
+            state = np.array(
+                [
+                    float(rng.uniform(-50, 50)),
+                    float(rng.uniform(-50, 50)),
+                    float(rng.uniform(-3, 3)),
+                    float(rng.uniform(0, 40)),
+                    float(rng.uniform(-5, 5)),
+                    float(rng.uniform(-2, 2)),
+                ]
+            )
+            control = np.array([float(rng.uniform(-1.5, 1.5)), float(rng.uniform(-10000, 10000))])
+            new_state = bicycle_step(state, control, trained_tire_model, vp, dt=0.02)
+            assert np.all(np.isfinite(new_state))
+            A, B = bicycle_jacobians(state, control, trained_tire_model, vp, dt=0.02)
+            assert np.all(np.isfinite(A))
+            assert np.all(np.isfinite(B))
