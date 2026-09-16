@@ -1,0 +1,532 @@
+"""
+bicycle_dynamics_tire_model.py
+----------------------------------
+Wires the neural-Pacejka hybrid tire model (previous deliverable) into
+an actual DYNAMIC bicycle model -- replacing the kinematic unicycle
+used everywhere else in this series with a vehicle model that has
+real mass, yaw inertia, load transfer, and tire forces that genuinely
+saturate. This closes the gap flagged at the end of the tire-model
+deliverable: "Fz here is still an independent input, not a real
+state-dependent quantity."
+
+State (6-dim):  s = [x, y, heading, vx, vy, r]
+    x, y     : position (m), world frame
+    heading  : yaw angle (rad)
+    vx, vy   : body-frame longitudinal / lateral velocity (m/s)
+    r        : yaw rate (rad/s)
+
+Control (2-dim): u = [delta, Fx]
+    delta : front steer angle (rad)
+    Fx    : longitudinal drive/brake force (N), applied at the rear
+            (see "Scope" below)
+
+Scope, deliberately narrow (consistent with every other deliverable in
+this series):
+  - Single-track (bicycle) model: front and rear axles each lumped
+    into one tire.
+  - NO combined slip: the front tire carries lateral force only (no
+    front-wheel drive/brake force feeding into a friction-ellipse
+    coupling with its lateral slip) -- this mirrors the neural-Pacejka
+    tire model's OWN declared scope (lateral force only), so nothing
+    here asks that model a question it wasn't built to answer.
+  - Longitudinal load transfer only (no lateral/roll load transfer,
+    i.e. no roll dynamics) -- Fz for each axle depends on the
+    commanded longitudinal force, using a static approximation (see
+    `axle_normal_loads`) that avoids an implicit fixed-point between
+    Fz and the tire forces it partly determines.
+  - The iLQR solver included here is a MINIMAL, generic
+    (dynamics-pluggable) reimplementation, with a simple goal +
+    control-effort cost -- it deliberately does NOT reintroduce the
+    Gaussian-bump risk-field machinery from the stochastic-iLQR
+    deliverable. Combining risk-aware routing with real tire dynamics
+    is a natural, substantial follow-up, not attempted here.
+
+Every analytic derivative in this file -- slip angles, load transfer,
+the full continuous-time dynamics Jacobian (which chains through the
+tire model's OWN already-validated gradient) -- is checked against
+finite differences in the test suite, the same standard applied to
+every differentiable component built earlier in this series.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Callable, List, Optional, Tuple
+
+import numpy as np
+
+from neural_pacejka import NeuralPacejkaTireModel
+
+STATE_DIM = 6
+CONTROL_DIM = 2
+
+# ==========================================================================
+# Vehicle parameters
+# ==========================================================================
+
+
+@dataclass(frozen=True)
+class VehicleParams:
+    """Representative passenger-car parameters (documented, not fit to
+    any specific real vehicle)."""
+
+    mass_kg: float = 1500.0
+    yaw_inertia_kgm2: float = 2500.0
+    lf_m: float = 1.2  # CG to front axle
+    lr_m: float = 1.6  # CG to rear axle
+    cg_height_m: float = 0.5
+    gravity_mps2: float = 9.81
+    vx_floor_mps: float = 0.5  # slip-angle denominator floor, see module docstring
+    fz_floor_n: float = 200.0  # never let a computed normal load reach zero/negative
+
+    def __post_init__(self):
+        if self.mass_kg <= 0 or self.yaw_inertia_kgm2 <= 0:
+            raise ValueError("mass and yaw inertia must be > 0")
+        if self.lf_m <= 0 or self.lr_m <= 0:
+            raise ValueError("lf_m and lr_m must be > 0")
+
+    @property
+    def wheelbase_m(self) -> float:
+        return self.lf_m + self.lr_m
+
+
+# ==========================================================================
+# Axle normal loads (longitudinal load transfer only)
+# ==========================================================================
+
+
+def axle_normal_loads(Fx: float, vp: VehicleParams) -> Tuple[float, float]:
+    """Static + longitudinal-load-transfer normal loads.
+
+        Fzf_static = m*g*lr / L,   Fzr_static = m*g*lf / L
+        Fzf = Fzf_static - Fx*h/L,  Fzr = Fzr_static + Fx*h/L
+
+    using ax_approx = Fx/m for the load-transfer term (ignoring the
+    tire forces' own, much smaller, contribution to longitudinal
+    acceleration for this purpose -- see module docstring). This
+    keeps Fz an explicit, non-implicit function of the CONTROL alone,
+    while still making it a genuine, physically-motivated function of
+    the vehicle's commanded behavior rather than a fixed constant.
+    """
+    L = vp.wheelbase_m
+    Fzf_static = vp.mass_kg * vp.gravity_mps2 * vp.lr_m / L
+    Fzr_static = vp.mass_kg * vp.gravity_mps2 * vp.lf_m / L
+    transfer = Fx * vp.cg_height_m / L
+    Fzf = max(Fzf_static - transfer, vp.fz_floor_n)
+    Fzr = max(Fzr_static + transfer, vp.fz_floor_n)
+    return Fzf, Fzr
+
+
+def axle_normal_loads_grad(Fx: float, vp: VehicleParams) -> Tuple[float, float, float, float]:
+    """Returns (Fzf, dFzf/dFx, Fzr, dFzr/dFx)."""
+    L = vp.wheelbase_m
+    Fzf_static = vp.mass_kg * vp.gravity_mps2 * vp.lr_m / L
+    Fzr_static = vp.mass_kg * vp.gravity_mps2 * vp.lf_m / L
+    transfer = Fx * vp.cg_height_m / L
+    Fzf_raw = Fzf_static - transfer
+    Fzr_raw = Fzr_static + transfer
+    dFzf_dFx = -vp.cg_height_m / L if Fzf_raw > vp.fz_floor_n else 0.0
+    dFzr_dFx = vp.cg_height_m / L if Fzr_raw > vp.fz_floor_n else 0.0
+    Fzf = max(Fzf_raw, vp.fz_floor_n)
+    Fzr = max(Fzr_raw, vp.fz_floor_n)
+    return Fzf, dFzf_dFx, Fzr, dFzr_dFx
+
+
+# ==========================================================================
+# Slip angles
+# ==========================================================================
+
+
+def slip_angles(state: np.ndarray, delta: float, vp: VehicleParams) -> Tuple[float, float]:
+    """alpha_f = delta - atan2(vy + lf*r, vx_eff)
+       alpha_r =        -atan2(vy - lr*r, vx_eff)
+    with vx_eff = max(vx, vx_floor) guarding the near-zero-speed
+    singularity in the slip-angle definition (a standard practical
+    treatment; see module docstring).
+    """
+    _, _, _, vx, vy, r = state
+    vx_eff = max(vx, vp.vx_floor_mps)
+    alpha_f = delta - math.atan2(vy + vp.lf_m * r, vx_eff)
+    alpha_r = -math.atan2(vy - vp.lr_m * r, vx_eff)
+    return alpha_f, alpha_r
+
+
+def slip_angles_grad(
+    state: np.ndarray, delta: float, vp: VehicleParams
+) -> Tuple[float, float, np.ndarray, np.ndarray]:
+    """Returns (alpha_f, alpha_r, d(alpha_f)/d[vx,vy,r,delta],
+    d(alpha_r)/d[vx,vy,r,delta]) using atan2's standard partials
+    (d/dy atan2(y,x) = x/(x^2+y^2), d/dx atan2(y,x) = -y/(x^2+y^2)).
+    The vx_eff floor's derivative is 0 when clipped (a flat region),
+    consistent with the same floor-clipping treatment used elsewhere
+    in this series (the tire model's own mu floor, the Simplex
+    Guard's friction floor).
+    """
+    _, _, _, vx, vy, r = state
+    clipped = vx <= vp.vx_floor_mps
+    vx_eff = vp.vx_floor_mps if clipped else vx
+    dvx_eff_dvx = 0.0 if clipped else 1.0
+
+    yf = vy + vp.lf_m * r
+    denom_f = yf ** 2 + vx_eff ** 2
+    dalphaf_dvy = -vx_eff / denom_f
+    dalphaf_dr = -vp.lf_m * vx_eff / denom_f
+    dalphaf_dvx = (yf / denom_f) * dvx_eff_dvx
+    dalphaf_ddelta = 1.0
+
+    yr = vy - vp.lr_m * r
+    denom_r = yr ** 2 + vx_eff ** 2
+    dalphar_dvy = -vx_eff / denom_r
+    dalphar_dr = vp.lr_m * vx_eff / denom_r
+    dalphar_dvx = (yr / denom_r) * dvx_eff_dvx
+    dalphar_ddelta = 0.0
+
+    alpha_f = delta - math.atan2(yf, vx_eff)
+    alpha_r = -math.atan2(yr, vx_eff)
+
+    # order: [vx, vy, r, delta]
+    grad_f = np.array([dalphaf_dvx, dalphaf_dvy, dalphaf_dr, dalphaf_ddelta])
+    grad_r = np.array([dalphar_dvx, dalphar_dvy, dalphar_dr, dalphar_ddelta])
+    return alpha_f, alpha_r, grad_f, grad_r
+
+
+# ==========================================================================
+# Continuous-time dynamics and Jacobian
+# ==========================================================================
+
+
+def bicycle_dynamics_continuous(
+    state: np.ndarray, control: np.ndarray, tire_model: NeuralPacejkaTireModel, vp: VehicleParams
+) -> np.ndarray:
+    """Returns state_dot = [x_dot, y_dot, heading_dot, vx_dot, vy_dot, r_dot]."""
+    x, y, heading, vx, vy, r = state
+    delta, Fx = control
+
+    Fzf, Fzr = axle_normal_loads(Fx, vp)
+    alpha_f, alpha_r = slip_angles(state, delta, vp)
+    Fyf = tire_model.force(alpha_f, Fzf)
+    Fyr = tire_model.force(alpha_r, Fzr)
+    Fyf, Fyr = float(Fyf), float(Fyr)
+
+    cos_h, sin_h = math.cos(heading), math.sin(heading)
+    cos_d, sin_d = math.cos(delta), math.sin(delta)
+
+    x_dot = vx * cos_h - vy * sin_h
+    y_dot = vx * sin_h + vy * cos_h
+    heading_dot = r
+    vx_dot = (-Fyf * sin_d + Fx) / vp.mass_kg + vy * r
+    vy_dot = (Fyf * cos_d + Fyr) / vp.mass_kg - vx * r
+    r_dot = (vp.lf_m * Fyf * cos_d - vp.lr_m * Fyr) / vp.yaw_inertia_kgm2
+
+    return np.array([x_dot, y_dot, heading_dot, vx_dot, vy_dot, r_dot])
+
+
+def bicycle_dynamics_continuous_jacobian(
+    state: np.ndarray, control: np.ndarray, tire_model: NeuralPacejkaTireModel, vp: VehicleParams
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Analytic continuous-time Jacobian (d(state_dot)/d(state) [6x6],
+    d(state_dot)/d(control) [6x2]), chaining through:
+      - the tire model's own validated (dF_y/dalpha, dF_y/dFz),
+      - the slip-angle partials above,
+      - the load-transfer partial (dFz/dFx),
+      - and full product rule on every Fyf*sin(delta)/Fyf*cos(delta)
+        term, since Fyf itself depends on delta (via alpha_f) in
+        addition to appearing multiplied by sin(delta)/cos(delta)
+        directly.
+    """
+    x, y, heading, vx, vy, r = state
+    delta, Fx = control
+    m, Iz, lf, lr = vp.mass_kg, vp.yaw_inertia_kgm2, vp.lf_m, vp.lr_m
+
+    Fzf, dFzf_dFx, Fzr, dFzr_dFx = axle_normal_loads_grad(Fx, vp)
+    alpha_f, alpha_r, grad_af, grad_ar = slip_angles_grad(state, delta, vp)
+    # grad_af/grad_ar order: [vx, vy, r, delta]
+
+    Fyf, dFyf_dalphaf, dFyf_dFzf = tire_model.force_and_grad(alpha_f, Fzf)
+    Fyr, dFyr_dalphar, dFyr_dFzr = tire_model.force_and_grad(alpha_r, Fzr)
+    Fyf, Fyr = float(Fyf), float(Fyr)
+
+    # Full derivative of Fyf w.r.t. each variable: chain rule through
+    # alpha_f(vx,vy,r,delta) AND through Fzf(Fx).
+    dFyf_dvx = dFyf_dalphaf * grad_af[0]
+    dFyf_dvy = dFyf_dalphaf * grad_af[1]
+    dFyf_dr = dFyf_dalphaf * grad_af[2]
+    dFyf_ddelta = dFyf_dalphaf * grad_af[3]
+    dFyf_dFx = dFyf_dFzf * dFzf_dFx
+
+    dFyr_dvx = dFyr_dalphar * grad_ar[0]
+    dFyr_dvy = dFyr_dalphar * grad_ar[1]
+    dFyr_dr = dFyr_dalphar * grad_ar[2]
+    dFyr_ddelta = dFyr_dalphar * grad_ar[3]  # == 0 (grad_ar[3] is 0 by construction)
+    dFyr_dFx = dFyr_dFzr * dFzr_dFx
+
+    cos_h, sin_h = math.cos(heading), math.sin(heading)
+    cos_d, sin_d = math.cos(delta), math.sin(delta)
+
+    A = np.zeros((STATE_DIM, STATE_DIM))
+    B = np.zeros((STATE_DIM, CONTROL_DIM))
+    # state order: [x, y, heading, vx, vy, r]; control order: [delta, Fx]
+    IX, IY, IH, IVX, IVY, IR = range(6)
+    IDELTA, IFX = range(2)
+
+    # x_dot = vx*cos(h) - vy*sin(h)
+    A[IX, IH] = -vx * sin_h - vy * cos_h
+    A[IX, IVX] = cos_h
+    A[IX, IVY] = -sin_h
+
+    # y_dot = vx*sin(h) + vy*cos(h)
+    A[IY, IH] = vx * cos_h - vy * sin_h
+    A[IY, IVX] = sin_h
+    A[IY, IVY] = cos_h
+
+    # heading_dot = r
+    A[IH, IR] = 1.0
+
+    # vx_dot = (-Fyf*sin(d) + Fx)/m + vy*r
+    A[IVX, IVX] = (-dFyf_dvx * sin_d) / m
+    A[IVX, IVY] = (-dFyf_dvy * sin_d) / m + r
+    A[IVX, IR] = (-dFyf_dr * sin_d) / m + vy
+    B[IVX, IDELTA] = (-(dFyf_ddelta * sin_d + Fyf * cos_d)) / m
+    B[IVX, IFX] = (-dFyf_dFx * sin_d + 1.0) / m
+
+    # vy_dot = (Fyf*cos(d) + Fyr)/m - vx*r
+    A[IVY, IVX] = (dFyf_dvx * cos_d + dFyr_dvx) / m - r
+    A[IVY, IVY] = (dFyf_dvy * cos_d + dFyr_dvy) / m
+    A[IVY, IR] = (dFyf_dr * cos_d + dFyr_dr) / m - vx
+    B[IVY, IDELTA] = (dFyf_ddelta * cos_d - Fyf * sin_d + dFyr_ddelta) / m
+    B[IVY, IFX] = (dFyf_dFx * cos_d + dFyr_dFx) / m
+
+    # r_dot = (lf*Fyf*cos(d) - lr*Fyr)/Iz
+    A[IR, IVX] = (lf * dFyf_dvx * cos_d - lr * dFyr_dvx) / Iz
+    A[IR, IVY] = (lf * dFyf_dvy * cos_d - lr * dFyr_dvy) / Iz
+    A[IR, IR] = (lf * dFyf_dr * cos_d - lr * dFyr_dr) / Iz
+    B[IR, IDELTA] = (lf * (dFyf_ddelta * cos_d - Fyf * sin_d) - lr * dFyr_ddelta) / Iz
+    B[IR, IFX] = (lf * dFyf_dFx * cos_d - lr * dFyr_dFx) / Iz
+
+    return A, B
+
+
+def bicycle_step(
+    state: np.ndarray, control: np.ndarray, tire_model: NeuralPacejkaTireModel, vp: VehicleParams, dt: float
+) -> np.ndarray:
+    """Explicit-Euler discrete step, consistent with the integration
+    scheme used for the unicycle model elsewhere in this series."""
+    state_dot = bicycle_dynamics_continuous(state, control, tire_model, vp)
+    return state + dt * state_dot
+
+
+def bicycle_jacobians(
+    state: np.ndarray, control: np.ndarray, tire_model: NeuralPacejkaTireModel, vp: VehicleParams, dt: float
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Discrete-time Jacobians via explicit-Euler discretization of
+    the continuous Jacobian: A_d = I + dt*A_c, B_d = dt*B_c."""
+    Ac, Bc = bicycle_dynamics_continuous_jacobian(state, control, tire_model, vp)
+    A_d = np.eye(STATE_DIM) + dt * Ac
+    B_d = dt * Bc
+    return A_d, B_d
+
+
+# ==========================================================================
+# Minimal, dynamics-pluggable iLQR solver (goal + control-effort cost only)
+# ==========================================================================
+
+
+@dataclass
+class SimpleCostConfig:
+    Q_running: np.ndarray  # (STATE_DIM, STATE_DIM)
+    R: np.ndarray  # (CONTROL_DIM, CONTROL_DIM)
+    Qf: np.ndarray  # (STATE_DIM, STATE_DIM)
+    goal: np.ndarray  # (STATE_DIM,)
+
+    def stage_cost(self, x: np.ndarray, u: np.ndarray) -> float:
+        dx = x - self.goal
+        return float(0.5 * dx @ self.Q_running @ dx + 0.5 * u @ self.R @ u)
+
+    def terminal_cost(self, x: np.ndarray) -> float:
+        dx = x - self.goal
+        return float(0.5 * dx @ self.Qf @ dx)
+
+    def stage_derivatives(self, x, u):
+        dx = x - self.goal
+        l_x = self.Q_running @ dx
+        l_u = self.R @ u
+        l_xx = self.Q_running.copy()
+        l_uu = self.R.copy()
+        l_ux = np.zeros((len(u), len(x)))
+        return l_x, l_u, l_xx, l_uu, l_ux
+
+    def terminal_derivatives(self, x):
+        dx = x - self.goal
+        return self.Qf @ dx, self.Qf.copy()
+
+
+DynamicsStepFn = Callable[[np.ndarray, np.ndarray, float], np.ndarray]
+DynamicsJacobianFn = Callable[[np.ndarray, np.ndarray, float], Tuple[np.ndarray, np.ndarray]]
+
+
+@dataclass
+class GenericILQRResult:
+    X: np.ndarray
+    U: np.ndarray
+    cost_history: List[float]
+    converged: bool
+    iterations: int
+
+
+class GenericILQRSolver:
+    """The same backward/forward-pass structure (Levenberg-Marquardt
+    regularization, line search, the predicted-improvement
+    convergence check) as the unicycle-specific ILQRSolver from the
+    stochastic-iLQR deliverable, generalized to accept ANY
+    step/Jacobian function pair and any state/control dimension,
+    rather than being hardcoded to the unicycle. This is what lets the
+    bicycle+tire dynamics above plug into iLQR without needing a
+    parallel, dynamics-specific solver reimplementation.
+    """
+
+    def __init__(
+        self,
+        step_fn: DynamicsStepFn,
+        jacobian_fn: DynamicsJacobianFn,
+        cost: SimpleCostConfig,
+        dt: float,
+        state_dim: int,
+        control_dim: int,
+        max_iters: int = 100,
+        cost_tol: float = 1e-4,
+        reg_init: float = 1.0,
+        reg_min: float = 1e-6,
+        reg_max: float = 1e8,
+        reg_factor: float = 2.0,
+        line_search_alphas: Optional[List[float]] = None,
+        max_control: Optional[np.ndarray] = None,
+    ):
+        self.step_fn = step_fn
+        self.jacobian_fn = jacobian_fn
+        self.cost = cost
+        self.dt = dt
+        self.state_dim = state_dim
+        self.control_dim = control_dim
+        self.max_iters = max_iters
+        self.cost_tol = cost_tol
+        self.reg_init = reg_init
+        self.reg_min = reg_min
+        self.reg_max = reg_max
+        self.reg_factor = reg_factor
+        self.line_search_alphas = line_search_alphas or [1.0, 0.5, 0.25, 0.1, 0.05, 0.01]
+        self.max_control = max_control
+
+    def _rollout(self, x0: np.ndarray, U: np.ndarray) -> np.ndarray:
+        T = U.shape[0]
+        X = np.zeros((T + 1, self.state_dim))
+        X[0] = x0
+        for t in range(T):
+            X[t + 1] = self.step_fn(X[t], U[t], self.dt)
+        return X
+
+    def _total_cost(self, X: np.ndarray, U: np.ndarray) -> float:
+        T = U.shape[0]
+        total = sum(self.cost.stage_cost(X[t], U[t]) for t in range(T))
+        total += self.cost.terminal_cost(X[T])
+        return total
+
+    def _clip_control(self, u: np.ndarray) -> np.ndarray:
+        if self.max_control is None:
+            return u
+        return np.clip(u, -self.max_control, self.max_control)
+
+    def _backward_pass(self, X, U, reg):
+        T = U.shape[0]
+        Vx, Vxx = self.cost.terminal_derivatives(X[T])
+        k_list = [None] * T
+        K_list = [None] * T
+        expected_improvement = 0.0
+        for t in reversed(range(T)):
+            x, u = X[t], U[t]
+            A, B = self.jacobian_fn(x, u, self.dt)
+            l_x, l_u, l_xx, l_uu, l_ux = self.cost.stage_derivatives(x, u)
+
+            Q_x = l_x + A.T @ Vx
+            Q_u = l_u + B.T @ Vx
+            Q_xx = l_xx + A.T @ Vxx @ A
+            Q_uu = l_uu + B.T @ Vxx @ B
+            Q_ux = l_ux + B.T @ Vxx @ A
+
+            Q_uu_reg = Q_uu + reg * np.eye(self.control_dim)
+            try:
+                np.linalg.cholesky(Q_uu_reg)
+            except np.linalg.LinAlgError:
+                return None
+
+            Q_uu_inv = np.linalg.inv(Q_uu_reg)
+            k = -Q_uu_inv @ Q_u
+            K = -Q_uu_inv @ Q_ux
+            expected_improvement += -(Q_u @ k + 0.5 * k @ Q_uu @ k)
+
+            Vx = Q_x + K.T @ Q_uu @ k + K.T @ Q_u + Q_ux.T @ k
+            Vxx = Q_xx + K.T @ Q_uu @ K + K.T @ Q_ux + Q_ux.T @ K
+            Vxx = 0.5 * (Vxx + Vxx.T)
+
+            k_list[t] = k
+            K_list[t] = K
+        return k_list, K_list, expected_improvement
+
+    def _forward_pass(self, X, U, k_list, K_list, current_cost):
+        T = U.shape[0]
+        for alpha in self.line_search_alphas:
+            X_new = np.zeros_like(X)
+            U_new = np.zeros_like(U)
+            X_new[0] = X[0]
+            for t in range(T):
+                dx = X_new[t] - X[t]
+                u = U[t] + alpha * k_list[t] + K_list[t] @ dx
+                u = self._clip_control(u)
+                U_new[t] = u
+                X_new[t + 1] = self.step_fn(X_new[t], u, self.dt)
+            new_cost = self._total_cost(X_new, U_new)
+            if np.isfinite(new_cost) and new_cost < current_cost:
+                return X_new, U_new, new_cost
+        return None
+
+    def solve(self, x0: np.ndarray, U_init: np.ndarray) -> GenericILQRResult:
+        X = self._rollout(x0, U_init)
+        U = U_init.copy()
+        cost = self._total_cost(X, U)
+        cost_history = [cost]
+        reg = self.reg_init
+        converged = False
+        it = 0
+
+        for it in range(1, self.max_iters + 1):
+            backward = None
+            while backward is None:
+                backward = self._backward_pass(X, U, reg)
+                if backward is None:
+                    reg *= self.reg_factor
+                    if reg > self.reg_max:
+                        return GenericILQRResult(X, U, cost_history, False, it)
+            k_list, K_list, expected_improvement = backward
+
+            if expected_improvement < self.cost_tol:
+                converged = True
+                break
+
+            result = self._forward_pass(X, U, k_list, K_list, cost)
+            if result is None:
+                reg *= self.reg_factor
+                if reg > self.reg_max:
+                    break
+                continue
+
+            X, U, new_cost = result
+            improvement = cost - new_cost
+            cost = new_cost
+            cost_history.append(cost)
+            reg = max(reg / self.reg_factor, self.reg_min)
+
+            if improvement < self.cost_tol:
+                converged = True
+                break
+
+        return GenericILQRResult(X, U, cost_history, converged, it)
