@@ -1,0 +1,204 @@
+"""
+debounced_simplex_guard.py
+------------------------------
+Closes the specific gap flagged (not hidden) in the previous
+deliverable's write-up: `StatefulSimplexGuard` releases its hold-over
+back to IDLE on the very first occupancy reading that shows no
+proximity hazard -- a single good frame in an otherwise-real, ongoing
+sensor problem (a momentary false-negative detection, a flickering
+reading at the edge of range) is enough to hand control back to a
+naive upstream planner mid-brake.
+
+This adds a `DebouncedSimplexGuard` that requires a SUSTAINED clear
+reading -- `release_confirmation_s` seconds of consecutive real
+readings that agree nothing proximity-hazardous is present -- before
+actually releasing. It is a subclass of `StatefulSimplexGuard`,
+overriding only the real-data-arrives code path; the dropout/grace/
+escalation machinery from the previous deliverable is reused entirely
+unmodified.
+
+DESIGN DECISIONS MADE EXPLICITLY HERE (same practice as every previous
+guard-related deliverable in this series -- a debatable default left
+implicit is worse than a documented one):
+
+  1. A single dropout (occupancy=None) cycle RESETS any in-progress
+     confirmation streak to zero. The streak is specifically about
+     SUSTAINED REAL clear readings; going blind again breaks that
+     chain -- we cannot claim to have "confirmed clear for N seconds"
+     across a gap where we had no visibility at all.
+
+  2. During the confirmation window (streak started but not yet
+     complete), the guard CONTINUES to actively enforce the ORIGINAL
+     captured fallback severity for that cycle too, even though the
+     single current reading says clear. Only delaying the internal
+     STATE label while letting the (still-unconfirmed) clear reading's
+     own live decision pass through unchanged would defeat the entire
+     purpose of debouncing -- the braking itself must not lapse during
+     the confirmation window, only the administrative release does.
+
+  3. Regaining real data (even if it doesn't yet confirm "clear" for
+     long enough) immediately drops the guard OUT of ESCALATED back
+     into HOLDING at the originally-captured severity, not a forced
+     maximal stop -- ESCALATED specifically represents "no data AND
+     grace expired"; the moment any real data returns, that condition
+     no longer holds, even before the release confirmation completes.
+
+Nothing in simplex_guard.py or stateful_simplex_guard.py is modified.
+"""
+
+from __future__ import annotations
+
+from typing import Optional, Tuple
+
+import numpy as np
+
+from simplex_guard import FallbackMode, GuardDecision, SimplexGuard, ViolationType
+from stateful_simplex_guard import (
+    PROXIMITY_VIOLATIONS,
+    HoldOverState,
+    StatefulSimplexGuard,
+    _FALLBACK_SEVERITY,
+)
+
+
+class DebouncedSimplexGuard(StatefulSimplexGuard):
+    """Drop-in replacement for StatefulSimplexGuard (and, transitively,
+    for SimplexGuard) that requires `release_confirmation_s` seconds
+    of consecutive confirmed-clear real readings before releasing a
+    hold-over back to IDLE.
+
+    Additional diagnostic exposed after each `check_and_override` call:
+        clear_streak_s : float -- accumulated duration of consecutive
+            real readings, since the last time the guard was blind or
+            actively re-confirmed a hazard, that showed no proximity
+            violation.
+    """
+
+    def __init__(
+        self,
+        inner_guard: Optional[SimplexGuard] = None,
+        hold_over_grace_s: float = 1.5,
+        release_confirmation_s: float = 0.5,
+    ):
+        super().__init__(inner_guard=inner_guard, hold_over_grace_s=hold_over_grace_s)
+        if release_confirmation_s < 0:
+            raise ValueError("release_confirmation_s must be >= 0")
+        self.release_confirmation_s = release_confirmation_s
+        self.clear_streak_s: float = 0.0
+
+    def reset(self) -> None:
+        super().reset()
+        self.clear_streak_s = 0.0
+
+    # -- overridden top-level dispatch --------------------------------------
+    #
+    # Overridden (rather than reused as-is) specifically so the
+    # real-data path has access to ego_state/dt_s/candidate_traj,
+    # which it needs to regenerate a held trajectory during the
+    # confirmation window -- the base class's real-data handler never
+    # needed those, since it always released immediately.
+
+    def check_and_override(
+        self,
+        candidate_traj: np.ndarray,
+        ego_state: np.ndarray,
+        occupancy: Optional[np.ndarray],
+        dt_s: float,
+        resolution_m: Optional[float] = None,
+        mu: Optional[float] = None,
+        occupancy_origin: Optional[Tuple[int, int]] = None,
+    ) -> Tuple[GuardDecision, np.ndarray, bool]:
+        inner_decision, inner_safe_traj, inner_overridden = self.inner.check_and_override(
+            candidate_traj, ego_state, occupancy, dt_s, resolution_m, mu, occupancy_origin
+        )
+
+        if occupancy is not None:
+            return self._handle_real_data_debounced(
+                inner_decision, inner_safe_traj, inner_overridden, candidate_traj, ego_state, dt_s
+            )
+
+        return self._handle_dropout(
+            inner_decision, inner_safe_traj, inner_overridden, candidate_traj, ego_state, dt_s
+        )
+
+    def _handle_dropout(self, inner_decision, inner_safe_traj, inner_overridden, candidate_traj, ego_state, dt_s):
+        # Any blind cycle breaks an in-progress confirmation streak --
+        # see design decision 1 above. The rest of the dropout
+        # machinery (grace timing, escalation, staying escalated) is
+        # entirely inherited, unmodified, from StatefulSimplexGuard.
+        self.clear_streak_s = 0.0
+        return super()._handle_dropout(inner_decision, inner_safe_traj, inner_overridden, candidate_traj, ego_state, dt_s)
+
+    # -- the new debounced real-data path -------------------------------------
+
+    def _handle_real_data_debounced(
+        self, inner_decision, inner_safe_traj, inner_overridden, candidate_traj, ego_state, dt_s
+    ):
+        if ViolationType.INVALID_SENSOR_INPUT in inner_decision.violations:
+            # Same policy as the base class: don't let a garbage
+            # ego-state reading update ANY memory, including the
+            # confirmation streak.
+            return inner_decision, inner_safe_traj, inner_overridden
+
+        self.elapsed_without_data_s = 0.0
+        proximity_now = tuple(v for v in inner_decision.violations if v in PROXIMITY_VIOLATIONS)
+
+        if proximity_now:
+            # Hazard actively reconfirmed (or newly found): capture/
+            # recapture immediately, same as the base class. A
+            # reconfirmed hazard resets the clear streak to zero --
+            # there is nothing "clear" to be confirming right now.
+            self.clear_streak_s = 0.0
+            self.state = HoldOverState.HOLDING
+            self.held_fallback_mode = (
+                inner_decision.fallback_mode
+                if inner_decision.fallback_mode in (FallbackMode.EMERGENCY_STOP, FallbackMode.COMFORT_STOP)
+                else FallbackMode.COMFORT_STOP
+            )
+            self._held_violations = proximity_now
+            return inner_decision, inner_safe_traj, inner_overridden
+
+        # This reading shows no proximity violation.
+        if self.state == HoldOverState.IDLE:
+            self.clear_streak_s = 0.0
+            return inner_decision, inner_safe_traj, inner_overridden
+
+        # State is HOLDING or ESCALATED, but real data has returned --
+        # see design decision 3: drop out of ESCALATED immediately.
+        self.state = HoldOverState.HOLDING
+        self.clear_streak_s += dt_s
+
+        if self.clear_streak_s >= self.release_confirmation_s:
+            self.state = HoldOverState.IDLE
+            self.held_fallback_mode = None
+            self._held_violations = ()
+            self.clear_streak_s = 0.0
+            return inner_decision, inner_safe_traj, inner_overridden
+
+        # Not yet confirmed: continue enforcing the ORIGINALLY
+        # captured severity for this cycle too -- see design decision
+        # 2. Never let this downgrade a live, more-severe,
+        # occupancy-independent check (there isn't one in the normal
+        # case, since proximity_now is empty here, but the guard would
+        # only reach this branch with inner_decision.fallback_mode ==
+        # NONE, so the merge is really just a defensive consistency
+        # check, kept for the same reason the dropout path keeps it).
+        held_mode = self.held_fallback_mode
+        if _FALLBACK_SEVERITY[inner_decision.fallback_mode] >= _FALLBACK_SEVERITY[held_mode]:
+            return inner_decision, inner_safe_traj, inner_overridden
+
+        held_traj = self._regenerate_fallback(held_mode, ego_state, dt_s, candidate_traj.shape[0])
+        merged_violations = tuple(
+            dict.fromkeys(
+                v for v in (*inner_decision.violations, *self._held_violations) if v != ViolationType.NONE
+            )
+        )
+        if not merged_violations:
+            merged_violations = self._held_violations or (ViolationType.STOPPING_DISTANCE,)
+
+        held_decision = inner_decision._replace(
+            overridden=True,
+            violations=merged_violations,
+            fallback_mode=held_mode,
+        )
+        return held_decision, held_traj, True
