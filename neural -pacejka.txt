@@ -1,0 +1,474 @@
+"""
+neural_pacejka.py
+--------------------
+A neural-Pacejka HYBRID lateral tire-force model (FSD v12 design doc,
+Improvement #2): a classical "Magic Formula" (Pacejka) tire model,
+augmented with a small feedforward neural network trained to predict
+the RESIDUAL between the classical model and a (synthetic) ground
+truth that includes a documented near-limit deviation the classical
+formula misses.
+
+This is a genuinely different kind of exercise from every other
+deliverable in this series: everything else here was kinematics +
+scripted scenarios. This is the first piece that involves (a) an
+actual physics model (tire lateral force as a nonlinear function of
+slip angle and normal load) and (b) a LEARNED component trained on
+data, even though the data itself is synthetic.
+
+SCOPE, DELIBERATELY NARROW (see accompanying write-up for the full
+reasoning): pure lateral force vs. slip angle and normal load. No
+combined slip (longitudinal + lateral coupling / friction ellipse), no
+camber, no relaxation length / transient dynamics. This mirrors how
+every other deliverable in this series started with the smallest
+self-contained slice rather than the whole subsystem at once.
+
+Implementation choices worth being explicit about:
+
+  - The neural network is implemented FROM SCRATCH in plain NumPy (no
+    PyTorch/JAX/autodiff framework), for the same reason the rest of
+    this series avoids heavy ML frameworks: it keeps the entire
+    computation small enough to read start to finish and to validate
+    every derivative against finite differences directly, the same
+    rigor applied to the Gaussian risk fields and unicycle dynamics in
+    the stochastic-iLQR deliverable.
+  - The "ground truth" used to generate synthetic training data is
+    ITSELF synthetic: the classical Pacejka formula plus a documented,
+    hand-specified near-limit deviation (see
+    `near_limit_deviation_force`) meant to resemble a real
+    phenomenon (accelerated grip loss past the handling limit, e.g.
+    from thermal/tread effects) that an idealized formula would miss.
+    This is not real tire test-rig data, and the deliverable does not
+    claim it is -- the point is to validate that the HYBRID
+    MODELING APPROACH AND THE MATH work correctly, the same way the
+    stochastic-iLQR deliverable validated risk-averse routing against
+    synthetic Gaussian bumps rather than real perception output.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from typing import List, Optional, Sequence, Tuple
+
+import numpy as np
+
+# ==========================================================================
+# Classical Pacejka ("Magic Formula") lateral tire model
+# ==========================================================================
+
+
+@dataclass(frozen=True)
+class PacejkaParams:
+    """Standard simplified "Magic Formula" coefficients for LATERAL
+    force vs. slip angle, plus a load-sensitivity term for the peak
+    factor. Values are representative of a passenger-car tire
+    (documented, not fit to any specific real vehicle):
+
+        B  : stiffness factor
+        C  : shape factor (~1.3 is a common literature value for
+             lateral force)
+        E  : curvature factor (negative values produce the "falling"
+             shape past the peak seen in real tire data)
+        mu0: nominal peak friction coefficient at the reference load
+        Fz0: reference normal load (N) at which mu0 applies
+        load_sensitivity: fractional reduction in EFFECTIVE friction
+             coefficient per unit (Fz - Fz0)/Fz0 -- models the real,
+             well-known phenomenon that a tire's peak achievable
+             friction COEFFICIENT (force/load) decreases somewhat as
+             load increases, even though peak FORCE still increases.
+    """
+
+    B: float = 8.0
+    C: float = 1.3
+    E: float = -1.0
+    mu0: float = 1.0
+    Fz0: float = 4000.0
+    load_sensitivity: float = 0.15
+    mu_floor: float = 0.05  # never let effective friction go to zero/negative
+
+    def __post_init__(self):
+        if self.Fz0 <= 0:
+            raise ValueError("Fz0 must be > 0")
+        if self.mu0 <= 0:
+            raise ValueError("mu0 must be > 0")
+
+
+def peak_factor_and_derivative(Fz: np.ndarray, params: PacejkaParams) -> Tuple[np.ndarray, np.ndarray]:
+    """Returns (D, dD/dFz) where D = mu_eff(Fz) * Fz is the Pacejka
+    "peak factor" -- the maximum achievable lateral force at this
+    load. mu_eff decreases linearly with load above Fz0 (load
+    sensitivity), floored at `mu_floor`.
+    """
+    Fz = np.asarray(Fz, dtype=np.float64)
+    mu_eff_unclipped = params.mu0 * (1.0 - params.load_sensitivity * (Fz - params.Fz0) / params.Fz0)
+    clipped = mu_eff_unclipped < params.mu_floor
+    mu_eff = np.where(clipped, params.mu_floor, mu_eff_unclipped)
+
+    d_mu_dFz = -params.mu0 * params.load_sensitivity / params.Fz0
+    D = mu_eff * Fz
+    # Product rule EXCEPT where clipped, where mu_eff is locally
+    # constant (the floor) and only the Fz factor contributes.
+    dD_dFz = np.where(clipped, params.mu_floor, d_mu_dFz * Fz + mu_eff)
+    return D, dD_dFz
+
+
+def lateral_force_classical(alpha: np.ndarray, Fz: np.ndarray, params: PacejkaParams) -> np.ndarray:
+    """Classical simplified Magic Formula:
+        F_y = D * sin(C * arctan(B*alpha - E*(B*alpha - arctan(B*alpha))))
+    """
+    alpha = np.asarray(alpha, dtype=np.float64)
+    Fz = np.asarray(Fz, dtype=np.float64)
+    if np.any(Fz < 0):
+        raise ValueError("normal load Fz must be >= 0")
+    D, _ = peak_factor_and_derivative(Fz, params)
+    Bx = params.B * alpha
+    u = Bx - params.E * (Bx - np.arctan(Bx))
+    return D * np.sin(params.C * u)
+
+
+def lateral_force_classical_grad(
+    alpha: np.ndarray, Fz: np.ndarray, params: PacejkaParams
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Returns (F_y, dF_y/dalpha, dF_y/dFz) in closed form.
+
+        u = B*alpha - E*(B*alpha - arctan(B*alpha))
+        du/dalpha = B*[(1-E) + E/(1+(B*alpha)^2)]
+        F_y = D * sin(C*u)
+        dF_y/dalpha = D * C * cos(C*u) * du/dalpha
+        dF_y/dFz     = (dD/dFz) * sin(C*u)      [u does not depend on Fz]
+    """
+    alpha = np.asarray(alpha, dtype=np.float64)
+    Fz = np.asarray(Fz, dtype=np.float64)
+    if np.any(Fz < 0):
+        raise ValueError("normal load Fz must be >= 0")
+    D, dD_dFz = peak_factor_and_derivative(Fz, params)
+    Bx = params.B * alpha
+    u = Bx - params.E * (Bx - np.arctan(Bx))
+    du_dalpha = params.B * ((1.0 - params.E) + params.E / (1.0 + Bx ** 2))
+
+    F_y = D * np.sin(params.C * u)
+    dF_dalpha = D * params.C * np.cos(params.C * u) * du_dalpha
+    dF_dFz = dD_dFz * np.sin(params.C * u)
+    return F_y, dF_dalpha, dF_dFz
+
+
+def linear_cornering_stiffness(Fz: np.ndarray, params: PacejkaParams) -> np.ndarray:
+    """Analytic small-slip-angle cornering stiffness dF_y/dalpha at
+    alpha=0. A standard Pacejka identity: at alpha=0, u=0 so
+    cos(C*u)=1 and du/dalpha = B*(1-E) + E*B = B, giving
+    dF_y/dalpha|_{alpha=0} = D * C * B.
+    """
+    D, _ = peak_factor_and_derivative(Fz, params)
+    return D * params.C * params.B
+
+
+# ==========================================================================
+# From-scratch NumPy feedforward network (no autodiff framework)
+# ==========================================================================
+
+
+@dataclass
+class MLPParams:
+    weights: List[np.ndarray]
+    biases: List[np.ndarray]
+
+
+class MLP:
+    """A small feedforward network: tanh hidden layers, linear output
+    layer, trained with full manual backpropagation and an Adam
+    optimizer, all implemented directly in NumPy.
+
+    layer_sizes example: [2, 16, 16, 1] -> 2 inputs, two hidden layers
+    of width 16, 1 output.
+    """
+
+    def __init__(self, layer_sizes: Sequence[int], seed: int = 0):
+        if len(layer_sizes) < 2:
+            raise ValueError("layer_sizes must have at least an input and output layer")
+        rng = np.random.default_rng(seed)
+        weights = []
+        biases = []
+        for fan_in, fan_out in zip(layer_sizes[:-1], layer_sizes[1:]):
+            # Xavier/Glorot initialization, standard for tanh networks.
+            limit = math.sqrt(6.0 / (fan_in + fan_out))
+            weights.append(rng.uniform(-limit, limit, size=(fan_in, fan_out)))
+            biases.append(np.zeros(fan_out))
+        self.params = MLPParams(weights=weights, biases=biases)
+        self.layer_sizes = list(layer_sizes)
+
+    @property
+    def n_layers(self) -> int:
+        return len(self.params.weights)
+
+    # -- forward -----------------------------------------------------------
+
+    def forward(self, X: np.ndarray) -> Tuple[np.ndarray, dict]:
+        """X: (N, in_dim). Returns (output (N, out_dim), cache) where
+        cache holds every layer's pre-activation and activation,
+        needed for backprop.
+        """
+        X = np.atleast_2d(X)
+        A = X
+        cache = {"A": [A], "Z": []}
+        n = self.n_layers
+        for i in range(n):
+            Z = A @ self.params.weights[i] + self.params.biases[i]
+            cache["Z"].append(Z)
+            if i < n - 1:
+                A = np.tanh(Z)
+            else:
+                A = Z  # linear output layer (regression)
+            cache["A"].append(A)
+        return A, cache
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        out, _ = self.forward(X)
+        return out
+
+    # -- backward ------------------------------------------------------------
+
+    def backward(self, cache: dict, dL_dout: np.ndarray) -> Tuple[List[np.ndarray], List[np.ndarray], np.ndarray]:
+        """Standard backprop. Returns (dW list, db list, dL/dInput).
+        `dL_dout` is the gradient of whatever scalar/vector quantity
+        the caller cares about, w.r.t. the network's OUTPUT -- for
+        training this is dLoss/dOutput; for computing the network's
+        own input-Jacobian (used by the hybrid tire model's analytic
+        gradient), this is simply an all-ones vector (see
+        `input_gradient` below).
+        """
+        n = self.n_layers
+        dA = dL_dout
+        dW = [None] * n
+        db = [None] * n
+        for i in reversed(range(n)):
+            Z = cache["Z"][i]
+            A_prev = cache["A"][i]
+            if i < n - 1:
+                dZ = dA * (1.0 - np.tanh(Z) ** 2)
+            else:
+                dZ = dA  # linear output layer
+            dW[i] = A_prev.T @ dZ
+            db[i] = dZ.sum(axis=0)
+            dA = dZ @ self.params.weights[i].T
+        dL_dinput = dA
+        return dW, db, dL_dinput
+
+    def input_gradient(self, X: np.ndarray) -> np.ndarray:
+        """dOutput/dInput for a (N, in_dim) batch, assuming a scalar
+        (1-dimensional) output -- exactly the case used by the hybrid
+        tire model. Reuses the same backward() pass used for training,
+        seeded with an all-ones output gradient instead of a loss
+        gradient; this is legitimate because dOutput/dInput IS
+        backward() with dL/dOutput = 1.
+        """
+        out, cache = self.forward(X)
+        if out.shape[1] != 1:
+            raise ValueError("input_gradient only supports scalar-output networks")
+        _, _, dL_dinput = self.backward(cache, np.ones_like(out))
+        return dL_dinput
+
+    # -- training --------------------------------------------------------
+
+    def train(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        epochs: int = 2000,
+        lr: float = 0.01,
+        batch_size: Optional[int] = None,
+        seed: int = 0,
+    ) -> List[float]:
+        """Full manual Adam optimizer, MSE loss. Returns the per-epoch
+        loss history (on the full training set, regardless of
+        batch_size) for convergence checking.
+        """
+        X = np.atleast_2d(X)
+        y = np.asarray(y, dtype=np.float64).reshape(-1, 1)
+        N = X.shape[0]
+        rng = np.random.default_rng(seed)
+
+        beta1, beta2, eps = 0.9, 0.999, 1e-8
+        m_w = [np.zeros_like(w) for w in self.params.weights]
+        v_w = [np.zeros_like(w) for w in self.params.weights]
+        m_b = [np.zeros_like(b) for b in self.params.biases]
+        v_b = [np.zeros_like(b) for b in self.params.biases]
+        t = 0
+
+        loss_history = []
+        bs = batch_size or N
+        for epoch in range(epochs):
+            perm = rng.permutation(N)
+            for start in range(0, N, bs):
+                idx = perm[start : start + bs]
+                Xb, yb = X[idx], y[idx]
+                out, cache = self.forward(Xb)
+                dL_dout = 2.0 * (out - yb) / Xb.shape[0]  # d(MSE)/d(out)
+                dW, db, _ = self.backward(cache, dL_dout)
+
+                t += 1
+                for i in range(self.n_layers):
+                    m_w[i] = beta1 * m_w[i] + (1 - beta1) * dW[i]
+                    v_w[i] = beta2 * v_w[i] + (1 - beta2) * dW[i] ** 2
+                    m_hat = m_w[i] / (1 - beta1 ** t)
+                    v_hat = v_w[i] / (1 - beta2 ** t)
+                    self.params.weights[i] -= lr * m_hat / (np.sqrt(v_hat) + eps)
+
+                    m_b[i] = beta1 * m_b[i] + (1 - beta1) * db[i]
+                    v_b[i] = beta2 * v_b[i] + (1 - beta2) * db[i] ** 2
+                    m_hat_b = m_b[i] / (1 - beta1 ** t)
+                    v_hat_b = v_b[i] / (1 - beta2 ** t)
+                    self.params.biases[i] -= lr * m_hat_b / (np.sqrt(v_hat_b) + eps)
+
+            full_out = self.predict(X)
+            loss_history.append(float(np.mean((full_out - y) ** 2)))
+        return loss_history
+
+
+# ==========================================================================
+# Synthetic "ground truth" (near-limit deviation the classical model misses)
+# ==========================================================================
+
+
+def near_limit_deviation_force(alpha: np.ndarray, Fz: np.ndarray, params: PacejkaParams) -> np.ndarray:
+    """A documented, hand-specified systematic deviation representing
+    accelerated grip loss past a slip-angle threshold -- the kind of
+    thermal/tread-wear effect a real tire exhibits near its handling
+    limit that an idealized Magic Formula, fit primarily to
+    moderate-slip data, tends to miss. This is SYNTHETIC by
+    construction (see module docstring) -- it exists to give the
+    residual network something structured and physically-motivated to
+    learn, not to model any specific real tire.
+
+    Shape: zero below the threshold, ramping smoothly (not a hard
+    corner) to up to 15% of the classical peak force beyond it, always
+    acting to REDUCE the force magnitude (i.e. opposing alpha's sign),
+    consistent with "the tire has less grip than the idealized formula
+    predicts, once you're far enough into the slip range."
+    """
+    alpha = np.asarray(alpha, dtype=np.float64)
+    Fz = np.asarray(Fz, dtype=np.float64)
+    threshold = 0.12  # rad, ~6.9 deg -- near where lateral force typically peaks
+    max_fraction = 0.15
+    ramp_rate = 15.0
+
+    D, _ = peak_factor_and_derivative(Fz, params)
+    excess = np.clip(np.abs(alpha) - threshold, 0.0, None)
+    shape = 1.0 - np.exp(-ramp_rate * excess)
+    magnitude = max_fraction * D * shape
+    return -np.sign(alpha) * magnitude
+
+
+def ground_truth_lateral_force(alpha: np.ndarray, Fz: np.ndarray, params: PacejkaParams) -> np.ndarray:
+    return lateral_force_classical(alpha, Fz, params) + near_limit_deviation_force(alpha, Fz, params)
+
+
+def generate_synthetic_dataset(
+    n_samples: int,
+    params: PacejkaParams,
+    alpha_range: Tuple[float, float] = (-0.35, 0.35),
+    Fz_range: Tuple[float, float] = (2000.0, 8000.0),
+    noise_std_n: float = 15.0,
+    seed: int = 0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Generates (alpha, Fz, noisy_ground_truth_force) triples,
+    simulating what a real tire test rig's raw measurements might look
+    like: samples across the slip-angle/load operating range, ground
+    truth from `ground_truth_lateral_force`, plus i.i.d. Gaussian
+    measurement noise (`noise_std_n` Newtons).
+    """
+    rng = np.random.default_rng(seed)
+    alpha = rng.uniform(*alpha_range, size=n_samples)
+    Fz = rng.uniform(*Fz_range, size=n_samples)
+    true_force = ground_truth_lateral_force(alpha, Fz, params)
+    noisy_force = true_force + rng.normal(0.0, noise_std_n, size=n_samples)
+    return alpha, Fz, noisy_force
+
+
+# ==========================================================================
+# Hybrid model
+# ==========================================================================
+
+
+@dataclass
+class InputNormalization:
+    alpha_scale: float
+    Fz_scale: float
+
+
+class NeuralPacejkaTireModel:
+    """Classical Pacejka + a trained MLP residual, with analytic
+    gradients combining the classical closed-form derivative and the
+    MLP's backprop-based input gradient via the chain rule through
+    input normalization.
+    """
+
+    def __init__(self, params: PacejkaParams, mlp: MLP, normalization: InputNormalization):
+        self.params = params
+        self.mlp = mlp
+        self.normalization = normalization
+
+    def _normalized_inputs(self, alpha: np.ndarray, Fz: np.ndarray) -> np.ndarray:
+        alpha = np.atleast_1d(np.asarray(alpha, dtype=np.float64))
+        Fz = np.atleast_1d(np.asarray(Fz, dtype=np.float64))
+        x1 = alpha / self.normalization.alpha_scale
+        x2 = Fz / self.normalization.Fz_scale
+        return np.stack([x1, x2], axis=1)
+
+    def force(self, alpha: np.ndarray, Fz: np.ndarray) -> np.ndarray:
+        classical = lateral_force_classical(alpha, Fz, self.params)
+        X = self._normalized_inputs(alpha, Fz)
+        residual = self.mlp.predict(X).reshape(-1)
+        result = classical.reshape(-1) + residual if np.ndim(classical) else classical + residual
+        return result if np.ndim(np.asarray(alpha)) else float(result[0])
+
+    def force_and_grad(
+        self, alpha: np.ndarray, Fz: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Returns (F_y, dF_y/dalpha, dF_y/dFz), combining:
+          - the classical model's closed-form derivative, plus
+          - the MLP residual's derivative via the chain rule:
+                d(residual)/dalpha = d(residual)/d(x1) * dx1/dalpha
+                                    = mlp_input_grad[:,0] / alpha_scale
+                d(residual)/dFz    = mlp_input_grad[:,1] / Fz_scale
+        """
+        scalar_input = np.ndim(np.asarray(alpha)) == 0
+        F_classical, dF_dalpha_classical, dF_dFz_classical = lateral_force_classical_grad(
+            alpha, Fz, self.params
+        )
+        X = self._normalized_inputs(alpha, Fz)
+        residual = self.mlp.predict(X).reshape(-1)
+        input_grad = self.mlp.input_gradient(X)  # (N, 2)
+        dresidual_dalpha = input_grad[:, 0] / self.normalization.alpha_scale
+        dresidual_dFz = input_grad[:, 1] / self.normalization.Fz_scale
+
+        F_total = np.atleast_1d(F_classical) + residual
+        dF_dalpha = np.atleast_1d(dF_dalpha_classical) + dresidual_dalpha
+        dF_dFz = np.atleast_1d(dF_dFz_classical) + dresidual_dFz
+
+        if scalar_input:
+            return float(F_total[0]), float(dF_dalpha[0]), float(dF_dFz[0])
+        return F_total, dF_dalpha, dF_dFz
+
+
+def train_neural_pacejka(
+    params: PacejkaParams,
+    alpha_train: np.ndarray,
+    Fz_train: np.ndarray,
+    residual_target: np.ndarray,
+    hidden_sizes: Sequence[int] = (16, 16),
+    epochs: int = 6000,
+    lr: float = 0.02,
+    seed: int = 0,
+    normalization: Optional[InputNormalization] = None,
+) -> Tuple[NeuralPacejkaTireModel, List[float]]:
+    """Convenience constructor: builds and trains the residual MLP on
+    (alpha, Fz) -> residual_target, and returns the assembled hybrid
+    model plus the training loss history.
+    """
+    normalization = normalization or InputNormalization(alpha_scale=0.35, Fz_scale=8000.0)
+    mlp = MLP([2, *hidden_sizes, 1], seed=seed)
+    x1 = np.asarray(alpha_train) / normalization.alpha_scale
+    x2 = np.asarray(Fz_train) / normalization.Fz_scale
+    X = np.stack([x1, x2], axis=1)
+    loss_history = mlp.train(X, residual_target, epochs=epochs, lr=lr, seed=seed)
+    return NeuralPacejkaTireModel(params, mlp, normalization), loss_history
