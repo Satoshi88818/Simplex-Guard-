@@ -1,0 +1,323 @@
+"""
+full_closed_loop_bicycle.py
+-------------------------------
+The capstone integration this series has been building toward: a risk-
+aware planner, running on REAL combined-slip vehicle dynamics, with a
+hard safety backstop that produces DYNAMICALLY HONEST fallback
+maneuvers -- all three running together in one closed loop, for the
+first time in this series.
+
+Three previously-separate lineages meet here:
+  - Risk-aware planning       (stochastic_ilqr.py, risk_aware_bicycle_ilqr.py)
+  - Real vehicle dynamics     (neural_pacejka.py, bicycle_dynamics_tire_model.py,
+                                combined_slip_tire_model.py, symmetrized_tire_model.py)
+  - The hard safety backstop  (simplex_guard.py and its stateful/debounced
+                                variants, bicycle_guard_integration.py)
+
+Nothing in any of those files is modified. This file adds exactly two
+new things:
+  - `RiskAwareBicyclePlanner`: a receding-horizon planner adapter, in
+    the same spirit as the unicycle-based ILQRPlanner from the
+    full-stack-integration deliverable, but for the 6-state bicycle
+    model -- and structurally SIMPLER than that adapter, because the
+    bicycle model's state already includes velocity as a proper state
+    variable, so there is no equivalent of that deliverable's Bug 1
+    (the plan's own controls needing to be reconciled against the
+    vehicle's real current speed after the fact) to work around here.
+  - `run_closed_loop_scenario`: a lightweight scenario runner (not a
+    full rebuild of closed_loop_sim.py's simulator class) that drives
+    a planner and an optional BicycleGuardAdapter through a scripted
+    static-obstacle scenario, reusing `closed_loop_sim.build_occupancy_grid`
+    unchanged for the sensing step.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from typing import List, Optional, Sequence, Tuple
+
+import numpy as np
+
+from stochastic_ilqr import GaussianBump, RiskField, ScalarField
+from bicycle_dynamics_tire_model import VehicleParams
+from combined_slip_tire_model import CONTROL_DIM, STATE_DIM, combined_slip_bicycle_step
+from neural_pacejka import NeuralPacejkaTireModel, PacejkaParams
+from risk_aware_bicycle_ilqr import RiskAwareBicycleCostConfig, make_risk_aware_bicycle_solver
+from bicycle_guard_integration import BicycleGuardAdapter
+from closed_loop_sim import VehicleState as OccupancyEgoState
+from closed_loop_sim import build_occupancy_grid
+
+
+# ==========================================================================
+# Planners
+# ==========================================================================
+
+
+@dataclass
+class RiskAwareBicyclePlannerConfig:
+    target_speed_mps: float = 15.0
+    risk_weight: float = 400.0
+    running_speed_weight: float = 5.0  # penalizes vx deviation from target at EVERY step, not just terminal --
+    # needed so the optimizer has leverage to accelerate toward cruise
+    # speed over a horizon shorter than however long full convergence
+    # would naturally take (see write-up Section 3 for why this
+    # matters and was not obvious from the previous deliverable's own,
+    # always-already-at-cruise-speed test scenarios).
+    control_cost: Tuple[float, float, float] = (80.0, 1e-7, 1e-7)  # delta, Fxf, Fxr
+    terminal_weights: Tuple[float, float, float, float, float, float] = (1.0, 150.0, 80.0, 100.0, 5.0, 5.0)
+    max_delta: float = 0.5
+    max_Fx: float = 3000.0
+    max_ilqr_iters: int = 300
+    cost_tol: float = 1e-3
+    uncertainty_amplitude: float = 1.0
+    occupancy_amplitude: float = 0.8
+    uncertainty_sigma_multiplier: float = 1.6
+    footprint_margin_m: float = 0.5
+
+
+class RiskAwareBicyclePlanner:
+    """Receding-horizon, risk-aware planner for the bicycle model.
+    Every cycle: builds a fresh RiskField in the ego-local frame from
+    whatever obstacles are currently visible (world positions rotated
+    into the ego's current heading -- position ONLY; body-frame
+    velocities vx/vy/r need no such transform, since they are already
+    defined relative to the vehicle's own heading regardless of which
+    world frame is used to express position), solves a fresh iLQR
+    problem with a receding-horizon "drive straight ahead at cruise
+    speed" goal, warm-started from the previous cycle's solution.
+
+    Returns (state_traj, control_traj), each length T, with
+    state_traj[0] EXACTLY equal to the real current state -- this
+    holds automatically here (unlike the unicycle-based ILQRPlanner
+    from full_stack_integration.py, which needed an explicit fix for
+    this) because the bicycle model's rollout starts from x0 = the
+    real state by construction, and velocity is a first-class part of
+    that state rather than something reconciled after the fact.
+    """
+
+    def __init__(
+        self,
+        tire_model: NeuralPacejkaTireModel,
+        pacejka_params: PacejkaParams,
+        vp: VehicleParams,
+        config: Optional[RiskAwareBicyclePlannerConfig] = None,
+    ):
+        self.tire_model = tire_model
+        self.pacejka_params = pacejka_params
+        self.vp = vp
+        self.config = config or RiskAwareBicyclePlannerConfig()
+        self._U_prev: Optional[np.ndarray] = None
+
+    def reset(self) -> None:
+        self._U_prev = None
+
+    def _build_risk_field(
+        self, ego_world: np.ndarray, visible_actors_world: Sequence[Tuple[float, float, float, float]]
+    ) -> Optional[RiskField]:
+        if not visible_actors_world:
+            return None
+        cfg = self.config
+        heading = ego_world[2]
+        cos_h, sin_h = math.cos(-heading), math.sin(-heading)
+        unc_bumps: List[GaussianBump] = []
+        occ_bumps: List[GaussianBump] = []
+        for wx, wy, length, width in visible_actors_world:
+            dx, dy = wx - ego_world[0], wy - ego_world[1]
+            lx = dx * cos_h - dy * sin_h
+            ly = dx * sin_h + dy * cos_h
+            base_sigma = max(length, width) / 2.0 + cfg.footprint_margin_m
+            occ_bumps.append(GaussianBump((lx, ly), cfg.occupancy_amplitude, base_sigma))
+            unc_bumps.append(GaussianBump((lx, ly), cfg.uncertainty_amplitude, base_sigma * cfg.uncertainty_sigma_multiplier))
+        return RiskField(ScalarField(unc_bumps), ScalarField(occ_bumps))
+
+    def generate(
+        self,
+        ego_world: np.ndarray,
+        T: int,
+        dt: float,
+        visible_actors_world: Sequence[Tuple[float, float, float, float]],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        cfg = self.config
+        risk_field = self._build_risk_field(ego_world, visible_actors_world)
+
+        vx, vy, r = ego_world[3], ego_world[4], ego_world[5]
+        x0_local = np.array([0.0, 0.0, 0.0, vx, vy, r])  # position/heading reset, velocities real
+        goal_local = np.array([cfg.target_speed_mps * T * dt, 0.0, 0.0, cfg.target_speed_mps, 0.0, 0.0])
+
+        cost = RiskAwareBicycleCostConfig(
+            Q_running=np.diag([0.0, 0.0, 0.0, cfg.running_speed_weight, 0.0, 0.0]),
+            R=np.diag(cfg.control_cost),
+            Qf=np.diag(cfg.terminal_weights),
+            goal=goal_local,
+            risk_weight=cfg.risk_weight if risk_field is not None else 0.0,
+            risk_field=risk_field,
+        )
+        solver = make_risk_aware_bicycle_solver(
+            self.tire_model, self.pacejka_params, self.vp, cost, dt=dt,
+            max_iters=cfg.max_ilqr_iters, max_control=np.array([cfg.max_delta, cfg.max_Fx, cfg.max_Fx]),
+        )
+        solver.cost_tol = cfg.cost_tol
+
+        if self._U_prev is not None and self._U_prev.shape[0] == T:
+            U_init = np.vstack([self._U_prev[1:], self._U_prev[-1:]])
+        else:
+            # A modest constant accelerating force (split across both
+            # axles) as the cold-start guess -- NOT zero, so the
+            # optimizer starts from "the vehicle is trying to reach
+            # cruise speed" rather than "the vehicle intends to coast
+            # forever," which is a much better basin to search from.
+            initial_accel_guess = 1.5  # m/s^2, a comfortable accel target
+            Fx_guess = self.vp.mass_kg * initial_accel_guess
+            U_init = np.tile(np.array([0.0, Fx_guess / 2.0, Fx_guess / 2.0]), (T, 1))
+
+        result = solver.solve(x0_local, U_init)
+        self._U_prev = result.U.copy()
+
+        state_traj = result.X[:-1]  # (T, 6), state_traj[0] == x0_local exactly
+        control_traj = result.U  # (T, 3)
+        return state_traj, control_traj
+
+
+class NaiveBicyclePlanner:
+    """Obstacle-blind planner: holds a constant, slowly-corrected
+    steering angle (toward straight) and a comfort-accel throttle
+    command, with NO awareness of obstacles at all -- the same role
+    NaivePlannerAdapter played in the full-stack-integration
+    deliverable, now for the bicycle model. Represents the realistic
+    worst case the guard must handle on its own.
+    """
+
+    def __init__(self, target_speed_mps: float = 15.0, comfort_accel_mps2: float = 2.0):
+        self.target_speed_mps = target_speed_mps
+        self.comfort_accel_mps2 = comfort_accel_mps2
+
+    def reset(self) -> None:
+        pass
+
+    def generate(
+        self,
+        ego_world: np.ndarray,
+        T: int,
+        dt: float,
+        visible_actors_world: Sequence[Tuple[float, float, float, float]],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        vx, vy, r = ego_world[3], ego_world[4], ego_world[5]
+        state_traj = np.zeros((T, STATE_DIM))
+        control_traj = np.zeros((T, CONTROL_DIM))
+        s = np.array([0.0, 0.0, 0.0, vx, vy, r])
+        for t in range(T):
+            state_traj[t] = s
+            Fx = self.vp_mass_accel() if s[3] < self.target_speed_mps else 0.0
+            control = np.array([0.0, Fx / 2.0, Fx / 2.0])
+            control_traj[t] = control
+            s = self._step(s, control, dt)
+        return state_traj, control_traj
+
+    def vp_mass_accel(self) -> float:
+        # Filled in by run_closed_loop_scenario via set_dynamics(); a
+        # tiny bit of indirection to avoid this simple planner needing
+        # a full tire-model/VehicleParams dependency of its own.
+        return self.vp.mass_kg * self.comfort_accel_mps2
+
+    def set_dynamics(self, tire_model, pacejka_params, vp):
+        self.tire_model = tire_model
+        self.pacejka_params = pacejka_params
+        self.vp = vp
+
+    def _step(self, s, control, dt):
+        return combined_slip_bicycle_step(s, control, self.tire_model, self.pacejka_params, self.vp, dt)
+
+
+# ==========================================================================
+# Lightweight closed-loop scenario runner
+# ==========================================================================
+
+
+@dataclass
+class ScenarioResult:
+    collided: bool
+    min_clearance_m: float
+    override_count: int
+    n_steps: int
+    final_world_state: np.ndarray
+    speed_history: List[float] = field(default_factory=list)
+    override_history: List[bool] = field(default_factory=list)
+
+
+def _rect_separation(ego_x, ego_y, ego_len, ego_w, act_x, act_y, act_len, act_w) -> float:
+    """Same 2D axis-aligned rectangle separation used by the
+    full-stack-integration deliverable's collision check."""
+    dx = max(0.0, abs(act_x - ego_x) - (ego_len / 2.0 + act_len / 2.0))
+    dy = max(0.0, abs(act_y - ego_y) - (ego_w / 2.0 + act_w / 2.0))
+    if dx == 0.0 and dy == 0.0:
+        return 0.0
+    return math.hypot(dx, dy)
+
+
+def run_closed_loop_scenario(
+    ego_init_world: np.ndarray,
+    planner,
+    guard_adapter: Optional[BicycleGuardAdapter],
+    obstacles: Sequence[Tuple[float, float, float, float]],  # static (x, y, length, width) in world frame
+    duration_s: float,
+    dt: float,
+    T: int,
+    grid_half_extent_m: float = 80.0,
+    grid_resolution_m: float = 0.5,
+    ego_length_m: float = 4.5,
+    ego_width_m: float = 2.0,
+) -> ScenarioResult:
+    planner.reset()
+    ego = np.array(ego_init_world, dtype=np.float64)
+    n_steps = int(round(duration_s / dt))
+    min_clearance = math.inf
+    collided = False
+    override_count = 0
+    speed_history: List[float] = []
+    override_history: List[bool] = []
+
+    for _ in range(n_steps):
+        occ_ego = OccupancyEgoState(x=ego[0], y=ego[1], heading=ego[2], speed=math.hypot(ego[3], ego[4]))
+        occupancy, origin = build_occupancy_grid(occ_ego, obstacles, grid_half_extent_m, grid_resolution_m)
+
+        candidate_state, candidate_control = planner.generate(ego, T, dt, obstacles)
+
+        if guard_adapter is not None:
+            ego_local = np.array([0.0, 0.0, 0.0, ego[3], ego[4], ego[5]])
+            decision, safe_state, safe_control, overridden = guard_adapter.check_and_override(
+                candidate_state, candidate_control, ego_local, occupancy, dt,
+                resolution_m=grid_resolution_m, occupancy_origin=origin,
+            )
+        else:
+            safe_control, overridden = candidate_control, False
+
+        if overridden:
+            override_count += 1
+            if hasattr(planner, "reset"):
+                planner.reset()  # discarded plan's warm-start is stale, same policy as full_stack_integration.py
+        override_history.append(overridden)
+
+        for ox, oy, olen, owid in obstacles:
+            gap = _rect_separation(ego[0], ego[1], ego_length_m, ego_width_m, ox, oy, olen, owid)
+            min_clearance = min(min_clearance, gap)
+            if gap <= 0.0:
+                collided = True
+
+        speed_history.append(float(math.hypot(ego[3], ego[4])))
+        if collided:
+            break
+
+        control0 = safe_control[0]
+        ego = combined_slip_bicycle_step(ego, control0, planner.tire_model, planner.pacejka_params, planner.vp, dt)
+        ego[3] = max(ego[3], 0.0)
+
+    return ScenarioResult(
+        collided=collided,
+        min_clearance_m=min_clearance if math.isfinite(min_clearance) else float("inf"),
+        override_count=override_count,
+        n_steps=len(speed_history),
+        final_world_state=ego,
+        speed_history=speed_history,
+        override_history=override_history,
+    )
