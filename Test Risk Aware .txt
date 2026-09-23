@@ -1,0 +1,446 @@
+"""
+test_risk_aware_bicycle_ilqr.py
+------------------------------------
+Test groups:
+
+  A. RiskAwareBicycleCostConfig unit tests: cost/derivative correctness
+     vs finite differences, confirming the risk term contributes only
+     to the (x, y) position block (never heading/vx/vy/r or control),
+     and that zero risk weight / no risk field is fully inert.
+  B. Confirms GenericILQRSolver genuinely needs no changes for a
+     risk-aware cost (same "verify the reuse claim" practice as the
+     combined-slip deliverable).
+  C. THE headline finding: risk-averse routing still functions under
+     real combined-slip vehicle dynamics -- monotonically increasing
+     clearance with risk weight, at three different speeds spanning
+     from minimal to substantial tire saturation (per the bicycle-
+     dynamics deliverable's own understeer table).
+  D. THE second headline finding: the symmetric-saddle limitation from
+     the original stochastic-iLQR deliverable REAPPEARS under bicycle
+     dynamics (confirming it's a property of the cost landscape's
+     symmetry, not an artifact of the kinematic unicycle), and the
+     same symmetry-breaking nudge fix resolves it here too.
+  E. Zero-uncertainty reduces the risk term to exactly zero, checked
+     through a full trajectory optimization (not just at a point).
+  F. Adversarial / edge cases.
+"""
+
+import math
+
+import numpy as np
+import pytest
+
+from neural_pacejka import (
+    PacejkaParams,
+    generate_synthetic_dataset,
+    lateral_force_classical,
+    train_neural_pacejka,
+)
+from bicycle_dynamics_tire_model import VehicleParams, GenericILQRSolver
+from combined_slip_tire_model import STATE_DIM, CONTROL_DIM
+from stochastic_ilqr import GaussianBump, ScalarField, RiskField
+from risk_aware_bicycle_ilqr import RiskAwareBicycleCostConfig, make_risk_aware_bicycle_solver
+
+
+def fd_derivative(f, x, eps=1e-6):
+    return (f(x + eps) - f(x - eps)) / (2 * eps)
+
+
+@pytest.fixture(scope="module")
+def trained_tire_model():
+    params = PacejkaParams()
+    alpha_train, Fz_train, force_train_noisy = generate_synthetic_dataset(2000, params, seed=0)
+    residual_target = force_train_noisy - lateral_force_classical(alpha_train, Fz_train, params)
+    model, _ = train_neural_pacejka(params, alpha_train, Fz_train, residual_target, seed=0)
+    return model, params
+
+
+@pytest.fixture(scope="module")
+def small_tire_model():
+    params = PacejkaParams()
+    alpha_train, Fz_train, force_train_noisy = generate_synthetic_dataset(300, params, seed=1)
+    residual_target = force_train_noisy - lateral_force_classical(alpha_train, Fz_train, params)
+    model, _ = train_neural_pacejka(
+        params, alpha_train, Fz_train, residual_target, hidden_sizes=(8, 8), epochs=200, seed=1
+    )
+    return model, params
+
+
+def make_risk_field(center, unc_amp=1.0, occ_amp=0.8, sigma=2.5):
+    unc = ScalarField([GaussianBump(center, unc_amp, sigma)])
+    occ = ScalarField([GaussianBump(center, occ_amp, sigma)])
+    return RiskField(unc, occ)
+
+
+# ==========================================================================
+# A. RiskAwareBicycleCostConfig unit tests
+# ==========================================================================
+
+
+class TestRiskAwareCostConfig:
+    def _make_cost(self, risk_weight=0.0, risk_field=None):
+        return RiskAwareBicycleCostConfig(
+            Q_running=np.diag([0.1, 0.1, 0.01, 0.01, 0.01, 0.01]),
+            R=np.diag([0.2, 1e-5, 1e-5]),
+            Qf=np.diag([5.0, 5.0, 1.0, 1.0, 1.0, 1.0]),
+            goal=np.array([3.0, 1.0, 0.2, 15.0, 0.0, 0.0]),
+            risk_weight=risk_weight,
+            risk_field=risk_field,
+        )
+
+    @pytest.mark.parametrize("seed", range(10))
+    def test_stage_cost_lx_matches_finite_difference_no_risk(self, seed):
+        rng = np.random.default_rng(seed)
+        cost = self._make_cost()
+        x = rng.uniform(-3, 3, 6)
+        u = rng.uniform(-2, 2, 3)
+        l_x, _, _, _, _ = cost.stage_derivatives(x, u)
+        numeric = np.zeros(6)
+        for i in range(6):
+            xp, xm = x.copy(), x.copy()
+            xp[i] += 1e-6
+            xm[i] -= 1e-6
+            numeric[i] = (cost.stage_cost(xp, u) - cost.stage_cost(xm, u)) / (2e-6)
+        np.testing.assert_allclose(l_x, numeric, atol=1e-4)
+
+    @pytest.mark.parametrize("seed", range(10))
+    def test_stage_cost_lu_matches_finite_difference(self, seed):
+        rng = np.random.default_rng(seed)
+        cost = self._make_cost()
+        x = rng.uniform(-3, 3, 6)
+        u = rng.uniform(-2, 2, 3)
+        _, l_u, _, _, _ = cost.stage_derivatives(x, u)
+        numeric = np.zeros(3)
+        for i in range(3):
+            up, um = u.copy(), u.copy()
+            up[i] += 1e-6
+            um[i] -= 1e-6
+            numeric[i] = (cost.stage_cost(x, up) - cost.stage_cost(x, um)) / (2e-6)
+        np.testing.assert_allclose(l_u, numeric, atol=1e-4)
+
+    def test_stage_cost_lxx_with_risk_term_matches_finite_difference(self):
+        risk_field = make_risk_field((1.2, 0.3), unc_amp=1.0, occ_amp=0.7, sigma=1.0)
+        cost = self._make_cost(risk_weight=25.0, risk_field=risk_field)
+        x = np.array([0.8, 0.4, 0.1, 15.0, 0.2, 0.01])
+        u = np.array([0.05, 100.0, -50.0])
+        _, _, l_xx, _, _ = cost.stage_derivatives(x, u)
+        eps = 1e-4
+        numeric = np.zeros((6, 6))
+        for i in range(6):
+            xp, xm = x.copy(), x.copy()
+            xp[i] += eps
+            xm[i] -= eps
+            gp, _, _, _, _ = cost.stage_derivatives(xp, u)
+            gm, _, _, _, _ = cost.stage_derivatives(xm, u)
+            numeric[:, i] = (gp - gm) / (2 * eps)
+        np.testing.assert_allclose(l_xx, numeric, atol=5e-2, rtol=1e-2)
+
+    def test_risk_term_contributes_only_to_position_block(self):
+        risk_field = make_risk_field((0.0, 0.0), unc_amp=1.0, occ_amp=1.0, sigma=1.0)
+        cost = self._make_cost(risk_weight=10.0, risk_field=risk_field)
+        cost_no_risk = self._make_cost()
+        x = np.array([0.5, 0.5, 0.3, 15.0, 0.2, 0.01])
+        u = np.array([0.02, 50.0, 20.0])
+
+        l_x, l_u, l_xx, l_uu, l_ux = cost.stage_derivatives(x, u)
+        l_x0, l_u0, l_xx0, l_uu0, l_ux0 = cost_no_risk.stage_derivatives(x, u)
+
+        # Heading, vx, vy, r rows/cols of l_x/l_xx unaffected by risk.
+        np.testing.assert_allclose(l_x[2:], l_x0[2:])
+        np.testing.assert_allclose(l_xx[2:, :], l_xx0[2:, :])
+        np.testing.assert_allclose(l_xx[:, 2:], l_xx0[:, 2:])
+        # Control derivatives entirely unaffected.
+        np.testing.assert_allclose(l_u, l_u0)
+        np.testing.assert_allclose(l_uu, l_uu0)
+        np.testing.assert_allclose(l_ux, l_ux0)
+
+    def test_zero_risk_weight_is_fully_inert(self):
+        risk_field = make_risk_field((0.0, 0.0), unc_amp=1.0, occ_amp=1.0, sigma=1.0)
+        cost_with_field_zero_weight = self._make_cost(risk_weight=0.0, risk_field=risk_field)
+        cost_none = self._make_cost(risk_weight=0.0, risk_field=None)
+        x = np.array([0.1, 0.1, 0.0, 15.0, 0.0, 0.0])
+        u = np.array([0.0, 0.0, 0.0])
+        assert cost_with_field_zero_weight.stage_cost(x, u) == pytest.approx(cost_none.stage_cost(x, u))
+
+    def test_terminal_derivatives_match_finite_difference(self):
+        cost = self._make_cost()
+        x = np.array([2.0, -1.0, 0.4, 12.0, 0.1, 0.02])
+        lf_x, lf_xx = cost.terminal_derivatives(x)
+        numeric_grad = np.zeros(6)
+        for i in range(6):
+            xp, xm = x.copy(), x.copy()
+            xp[i] += 1e-6
+            xm[i] -= 1e-6
+            numeric_grad[i] = (cost.terminal_cost(xp) - cost.terminal_cost(xm)) / (2e-6)
+        np.testing.assert_allclose(lf_x, numeric_grad, atol=1e-4)
+
+
+# ==========================================================================
+# B. Confirms GenericILQRSolver needs no changes
+# ==========================================================================
+
+
+class TestSolverReuse:
+    def test_solver_accepts_risk_aware_cost_without_modification(self, small_tire_model):
+        tire_model, params = small_tire_model
+        vp = VehicleParams()
+        risk_field = make_risk_field((10.0, 1.0))
+        goal = np.array([20.0, 0.0, 0.0, 15.0, 0.0, 0.0])
+        cost = RiskAwareBicycleCostConfig(
+            Q_running=np.zeros((STATE_DIM, STATE_DIM)),
+            R=np.diag([80.0, 0.0008, 0.0008]),
+            Qf=np.diag([1.0, 100.0, 50.0, 5.0, 5.0, 5.0]),
+            goal=goal,
+            risk_weight=200.0,
+            risk_field=risk_field,
+        )
+        solver = make_risk_aware_bicycle_solver(
+            tire_model, params, vp, cost, dt=0.025, max_iters=100, max_control=np.array([0.5, 3000.0, 3000.0])
+        )
+        assert isinstance(solver, GenericILQRSolver)
+        x0 = np.array([0.0, 0.0, 0.0, 15.0, 0.0, 0.0])
+        result = solver.solve(x0, np.zeros((30, 3)))
+        assert np.all(np.isfinite(result.X))
+        assert np.all(np.isfinite(result.U))
+
+    def test_cost_is_monotonically_non_increasing(self, small_tire_model):
+        tire_model, params = small_tire_model
+        vp = VehicleParams()
+        risk_field = make_risk_field((8.0, 0.5))
+        goal = np.array([15.0, 1.0, 0.0, 15.0, 0.0, 0.0])
+        cost = RiskAwareBicycleCostConfig(
+            Q_running=np.zeros((STATE_DIM, STATE_DIM)),
+            R=np.diag([80.0, 0.0008, 0.0008]),
+            Qf=np.diag([1.0, 100.0, 50.0, 5.0, 5.0, 5.0]),
+            goal=goal,
+            risk_weight=300.0,
+            risk_field=risk_field,
+        )
+        solver = make_risk_aware_bicycle_solver(tire_model, params, vp, cost, dt=0.025, max_iters=80)
+        x0 = np.array([0.0, 0.0, 0.0, 15.0, 0.0, 0.0])
+        result = solver.solve(x0, np.zeros((25, 3)))
+        history = result.cost_history
+        assert all(c2 <= c1 + 1e-9 for c1, c2 in zip(history, history[1:]))
+
+
+# ==========================================================================
+# C. Headline finding: risk-averse routing under real tire dynamics
+# ==========================================================================
+
+
+def run_detour(
+    v0, risk_weight, tire_model, params, vp,
+    obstacle_y=1.2, obstacle_frac=0.4, T=120, dt=0.025,
+    y_weight=200.0, heading_weight=100.0, symmetry_nudge=0.05, max_iters=500,
+):
+    travel = v0 * T * dt
+    obstacle_center = (travel * obstacle_frac, obstacle_y)
+    risk_field = make_risk_field(obstacle_center)
+    goal = np.array([travel, 0.0, 0.0, v0, 0.0, 0.0])
+    cost = RiskAwareBicycleCostConfig(
+        Q_running=np.zeros((STATE_DIM, STATE_DIM)),
+        R=np.diag([80.0, 0.0008, 0.0008]),
+        Qf=np.diag([1.0, y_weight, heading_weight, 5.0, 5.0, 5.0]),
+        goal=goal,
+        risk_weight=risk_weight,
+        risk_field=risk_field,
+    )
+    solver = make_risk_aware_bicycle_solver(
+        tire_model, params, vp, cost, dt=dt, max_iters=max_iters, max_control=np.array([0.5, 4000.0, 4000.0])
+    )
+    x0 = np.array([0.0, 0.0, 0.0, v0, 0.0, 0.0])
+    U_init = np.tile(np.array([0.0, 0.0, 0.0]), (T, 1))
+    if symmetry_nudge:
+        U_init[5, 0] = symmetry_nudge
+    result = solver.solve(x0, U_init)
+    return result, np.array(obstacle_center)
+
+
+class TestRiskAverseRoutingUnderRealDynamics:
+    def test_zero_risk_weight_drives_straight_at_baseline_clearance(self, trained_tire_model):
+        """With no risk cost, the vehicle should drive essentially
+        straight, passing the obstacle at exactly the geometric
+        distance a straight path gives (obstacle_y), confirming the
+        harness itself isn't introducing spurious avoidance."""
+        tire_model, params = trained_tire_model
+        vp = VehicleParams()
+        result, center = run_detour(20.0, 0.0, tire_model, params, vp)
+        min_dist = np.linalg.norm(result.X[:, :2] - center, axis=1).min()
+        assert min_dist == pytest.approx(1.2, abs=0.05)
+
+    @pytest.mark.parametrize("v0", [10.0, 20.0, 30.0])
+    def test_detour_distance_monotonic_in_risk_weight(self, v0, trained_tire_model):
+        """THE headline finding: increasing risk weight must never
+        make the optimizer route CLOSER to the risky region, even
+        under full combined-slip vehicle dynamics with real,
+        speed-dependent grip limits -- checked at three speeds
+        spanning from minimal (10 m/s) to substantial (30 m/s) tire
+        saturation, per the bicycle-dynamics deliverable's own
+        understeer table.
+        """
+        tire_model, params = trained_tire_model
+        vp = VehicleParams()
+        r0, center0 = run_detour(v0, 0.0, tire_model, params, vp)
+        r1, center1 = run_detour(v0, 300.0, tire_model, params, vp)
+        r2, center2 = run_detour(v0, 1000.0, tire_model, params, vp)
+        d0 = np.linalg.norm(r0.X[:, :2] - center0, axis=1).min()
+        d1 = np.linalg.norm(r1.X[:, :2] - center1, axis=1).min()
+        d2 = np.linalg.norm(r2.X[:, :2] - center2, axis=1).min()
+        assert d1 >= d0 - 1e-6
+        assert d2 >= d1 - 1e-6
+        assert d2 > d0 + 2.0  # substantial, not a rounding-level nudge
+
+    @pytest.mark.parametrize("v0", [10.0, 20.0, 30.0])
+    def test_all_headline_configurations_converge(self, v0, trained_tire_model):
+        tire_model, params = trained_tire_model
+        vp = VehicleParams()
+        for rw in [0.0, 300.0, 1000.0]:
+            result, _ = run_detour(v0, rw, tire_model, params, vp)
+            assert result.converged, f"v0={v0}, risk_weight={rw} failed to converge"
+
+    @pytest.mark.parametrize("v0", [10.0, 20.0, 30.0])
+    def test_reaches_goal_reasonably_despite_detour(self, v0, trained_tire_model):
+        """Risk-awareness must not come at the cost of abandoning the
+        task -- the detoured trajectory must still end up close to the
+        lane center, even if not exactly on it (see write-up for the
+        honest discussion of residual terminal offset at low speed
+        with aggressive risk weight)."""
+        tire_model, params = trained_tire_model
+        vp = VehicleParams()
+        result, _ = run_detour(v0, 300.0, tire_model, params, vp)
+        assert abs(result.X[-1, 1]) < 1.0
+
+
+# ==========================================================================
+# D. The symmetric-saddle limitation reappears, and the same fix works
+# ==========================================================================
+
+
+class TestSymmetricSaddleUnderBicycleDynamics:
+    def test_symmetric_obstacle_without_nudge_remains_on_the_saddle(self, trained_tire_model):
+        """Confirms the ORIGINAL stochastic-iLQR deliverable's
+        symmetric-saddle finding is a property of the COST LANDSCAPE's
+        symmetry, not an artifact specific to the kinematic unicycle:
+        with a perfectly symmetric obstacle and a symmetric initial
+        guess, the bicycle+combined-slip optimizer gets stuck on the
+        centerline here too.
+        """
+        tire_model, params = trained_tire_model
+        vp = VehicleParams()
+        result, center = run_detour(20.0, 500.0, tire_model, params, vp, obstacle_y=0.0, symmetry_nudge=0.0)
+        min_dist = np.linalg.norm(result.X[:, :2] - center, axis=1).min()
+        assert min_dist < 0.5, (
+            "expected the symmetric case to remain stuck on the centerline "
+            "saddle even with real vehicle dynamics; if this now detours "
+            "on its own, the finding needs to be revisited"
+        )
+
+    def test_same_symmetry_breaking_nudge_resolves_it_here_too(self, trained_tire_model):
+        tire_model, params = trained_tire_model
+        vp = VehicleParams()
+        result, center = run_detour(20.0, 500.0, tire_model, params, vp, obstacle_y=0.0, symmetry_nudge=0.05)
+        min_dist = np.linalg.norm(result.X[:, :2] - center, axis=1).min()
+        assert min_dist > 3.0
+
+
+# ==========================================================================
+# E. Zero uncertainty reduces risk term to exactly zero
+# ==========================================================================
+
+
+class TestZeroUncertaintyReducesToNoRisk(object):
+    def test_zero_uncertainty_makes_risk_weight_irrelevant_through_full_optimization(self, small_tire_model):
+        tire_model, params = small_tire_model
+        vp = VehicleParams()
+        zero_uncertainty = ScalarField([])
+        high_occupancy = ScalarField([GaussianBump((10.0, 1.0), 1.0, 2.0)])
+        risk_field = RiskField(zero_uncertainty, high_occupancy)
+
+        goal = np.array([20.0, 0.0, 0.0, 15.0, 0.0, 0.0])
+        cost_huge_weight = RiskAwareBicycleCostConfig(
+            Q_running=np.zeros((STATE_DIM, STATE_DIM)), R=np.diag([80.0, 0.0008, 0.0008]),
+            Qf=np.diag([1.0, 100.0, 50.0, 5.0, 5.0, 5.0]), goal=goal,
+            risk_weight=1e6, risk_field=risk_field,
+        )
+        cost_no_risk = RiskAwareBicycleCostConfig(
+            Q_running=np.zeros((STATE_DIM, STATE_DIM)), R=np.diag([80.0, 0.0008, 0.0008]),
+            Qf=np.diag([1.0, 100.0, 50.0, 5.0, 5.0, 5.0]), goal=goal,
+            risk_weight=0.0, risk_field=None,
+        )
+        T = 30
+        U_init = np.zeros((T, 3))
+        r1 = make_risk_aware_bicycle_solver(tire_model, params, vp, cost_huge_weight, dt=0.025, max_iters=80).solve(
+            np.array([0.0, 0.0, 0.0, 15.0, 0.0, 0.0]), U_init.copy()
+        )
+        r2 = make_risk_aware_bicycle_solver(tire_model, params, vp, cost_no_risk, dt=0.025, max_iters=80).solve(
+            np.array([0.0, 0.0, 0.0, 15.0, 0.0, 0.0]), U_init.copy()
+        )
+        np.testing.assert_allclose(r1.X, r2.X, atol=1e-6)
+        np.testing.assert_allclose(r1.U, r2.U, atol=1e-6)
+
+
+# ==========================================================================
+# F. Adversarial / edge cases
+# ==========================================================================
+
+
+class TestAdversarialAndEdgeCases:
+    def test_no_risk_field_with_positive_weight_does_not_crash(self, small_tire_model):
+        """risk_weight > 0 but risk_field=None must be handled
+        gracefully (treated as no risk cost), not crash on a None
+        dereference."""
+        tire_model, params = small_tire_model
+        vp = VehicleParams()
+        goal = np.array([10.0, 0.0, 0.0, 15.0, 0.0, 0.0])
+        cost = RiskAwareBicycleCostConfig(
+            Q_running=np.zeros((STATE_DIM, STATE_DIM)), R=np.diag([80.0, 0.0008, 0.0008]),
+            Qf=np.diag([1.0, 50.0, 20.0, 5.0, 5.0, 5.0]), goal=goal,
+            risk_weight=500.0, risk_field=None,
+        )
+        solver = make_risk_aware_bicycle_solver(tire_model, params, vp, cost, dt=0.025, max_iters=50)
+        result = solver.solve(np.array([0.0, 0.0, 0.0, 15.0, 0.0, 0.0]), np.zeros((20, 3)))
+        assert np.all(np.isfinite(result.X))
+
+    def test_goal_equals_start_converges_trivially(self, small_tire_model):
+        tire_model, params = small_tire_model
+        vp = VehicleParams()
+        x0 = np.array([0.0, 0.0, 0.0, 15.0, 0.0, 0.0])
+        cost = RiskAwareBicycleCostConfig(
+            Q_running=np.zeros((STATE_DIM, STATE_DIM)), R=np.diag([80.0, 0.0008, 0.0008]),
+            Qf=np.diag([1.0, 50.0, 20.0, 5.0, 5.0, 5.0]), goal=x0.copy(),
+        )
+        solver = make_risk_aware_bicycle_solver(tire_model, params, vp, cost, dt=0.025, max_iters=30)
+        result = solver.solve(x0, np.zeros((10, 3)))
+        assert result.converged
+        np.testing.assert_allclose(result.U, np.zeros((10, 3)), atol=1e-6)
+
+    def test_single_step_horizon_does_not_crash(self, small_tire_model):
+        tire_model, params = small_tire_model
+        vp = VehicleParams()
+        risk_field = make_risk_field((5.0, 0.5))
+        goal = np.array([1.0, 0.1, 0.0, 15.0, 0.0, 0.0])
+        cost = RiskAwareBicycleCostConfig(
+            Q_running=np.zeros((STATE_DIM, STATE_DIM)), R=np.diag([80.0, 0.0008, 0.0008]),
+            Qf=np.diag([1.0, 50.0, 20.0, 5.0, 5.0, 5.0]), goal=goal,
+            risk_weight=200.0, risk_field=risk_field,
+        )
+        solver = make_risk_aware_bicycle_solver(tire_model, params, vp, cost, dt=0.025, max_iters=20)
+        result = solver.solve(np.array([0.0, 0.0, 0.0, 15.0, 0.0, 0.0]), np.zeros((1, 3)))
+        assert result.X.shape == (2, STATE_DIM)
+
+    def test_extreme_risk_weight_does_not_produce_nan(self, small_tire_model):
+        tire_model, params = small_tire_model
+        vp = VehicleParams()
+        risk_field = make_risk_field((8.0, 0.5))
+        goal = np.array([15.0, 0.0, 0.0, 15.0, 0.0, 0.0])
+        cost = RiskAwareBicycleCostConfig(
+            Q_running=np.zeros((STATE_DIM, STATE_DIM)), R=np.diag([80.0, 0.0008, 0.0008]),
+            Qf=np.diag([1.0, 50.0, 20.0, 5.0, 5.0, 5.0]), goal=goal,
+            risk_weight=1e8, risk_field=risk_field,
+        )
+        solver = make_risk_aware_bicycle_solver(
+            tire_model, params, vp, cost, dt=0.025, max_iters=100, max_control=np.array([0.5, 3000.0, 3000.0])
+        )
+        result = solver.solve(np.array([0.0, 0.0, 0.0, 15.0, 0.0, 0.0]), np.zeros((25, 3)))
+        assert np.all(np.isfinite(result.X))
+        assert np.all(np.isfinite(result.U))
