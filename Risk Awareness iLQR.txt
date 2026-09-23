@@ -1,0 +1,124 @@
+"""
+risk_aware_bicycle_ilqr.py
+------------------------------
+Answers the question left open across the last three deliverables:
+does risk-averse routing (the Gaussian-bump "epistemic uncertainty x
+occupancy" cost from the stochastic-iLQR deliverable) still produce
+sensible detours once the vehicle has REAL tire physics -- combined-
+slip grip limits on both axles -- instead of the kinematic unicycle's
+unlimited, speed-independent turning capability?
+
+This is a wiring exercise, not new physics or new math: every piece
+used here was already independently built and validated --
+
+  - GaussianBump / ScalarField / RiskField  (stochastic-iLQR deliverable)
+  - GenericILQRSolver                        (bicycle-dynamics deliverable)
+  - combined_slip_bicycle_step/_jacobians     (combined-slip deliverable)
+
+The only new code is `RiskAwareBicycleCostConfig`, a cost object that
+implements the same four-method protocol GenericILQRSolver already
+expects (stage_cost, terminal_cost, stage_derivatives,
+terminal_derivatives) -- confirmed by inspection that the solver
+never type-checks its cost argument, only calls these methods on it,
+which is exactly what let the combined-slip deliverable add a third
+control dimension without touching the solver, and is exactly what
+lets this deliverable add a risk term without touching it either.
+
+Nothing in stochastic_ilqr.py, bicycle_dynamics_tire_model.py,
+combined_slip_tire_model.py, or neural_pacejka.py is modified.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
+import numpy as np
+
+from stochastic_ilqr import RiskField
+from bicycle_dynamics_tire_model import VehicleParams, GenericILQRSolver
+from combined_slip_tire_model import (
+    CONTROL_DIM,
+    STATE_DIM,
+    combined_slip_bicycle_jacobians,
+    combined_slip_bicycle_step,
+)
+from neural_pacejka import NeuralPacejkaTireModel, PacejkaParams
+
+
+@dataclass
+class RiskAwareBicycleCostConfig:
+    """Same role as stochastic_ilqr.CostConfig, generalized from the
+    3-state unicycle to the 6-state bicycle: [x, y, heading, vx, vy, r].
+    The risk term is added into the position block (indices 0, 1)
+    exactly as it was for the unicycle's own indices 0, 1 -- the risk
+    field only ever cared about (x, y), never about what other state
+    variables existed alongside it.
+    """
+
+    Q_running: np.ndarray  # (STATE_DIM, STATE_DIM)
+    R: np.ndarray  # (CONTROL_DIM, CONTROL_DIM)
+    Qf: np.ndarray  # (STATE_DIM, STATE_DIM)
+    goal: np.ndarray  # (STATE_DIM,)
+    risk_weight: float = 0.0
+    risk_field: Optional[RiskField] = None
+
+    def stage_cost(self, x: np.ndarray, u: np.ndarray) -> float:
+        dx = x - self.goal
+        cost = 0.5 * dx @ self.Q_running @ dx + 0.5 * u @ self.R @ u
+        if self.risk_weight > 0 and self.risk_field is not None:
+            cost += self.risk_weight * self.risk_field.value(x[:2])
+        return float(cost)
+
+    def terminal_cost(self, x: np.ndarray) -> float:
+        dx = x - self.goal
+        return float(0.5 * dx @ self.Qf @ dx)
+
+    def stage_derivatives(
+        self, x: np.ndarray, u: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        dx = x - self.goal
+        l_x = self.Q_running @ dx
+        l_u = self.R @ u
+        l_xx = self.Q_running.copy()
+        l_uu = self.R.copy()
+        l_ux = np.zeros((CONTROL_DIM, STATE_DIM))
+
+        if self.risk_weight > 0 and self.risk_field is not None:
+            p = x[:2]
+            g = self.risk_field.gradient(p)
+            H = self.risk_field.hessian(p)
+            l_x = l_x.copy()
+            l_x[:2] += self.risk_weight * g
+            l_xx = l_xx.copy()
+            l_xx[:2, :2] += self.risk_weight * H
+            # No u- or (heading, vx, vy, r)-dependence in the risk
+            # term, so l_u, l_uu, l_ux get no contribution from it --
+            # same reasoning as the unicycle-based CostConfig.
+
+        return l_x, l_u, l_xx, l_uu, l_ux
+
+    def terminal_derivatives(self, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        dx = x - self.goal
+        return self.Qf @ dx, self.Qf.copy()
+
+
+def make_risk_aware_bicycle_solver(
+    tire_model: NeuralPacejkaTireModel,
+    pacejka_params: PacejkaParams,
+    vp: VehicleParams,
+    cost: RiskAwareBicycleCostConfig,
+    dt: float,
+    max_iters: int = 100,
+    max_control: Optional[np.ndarray] = None,
+) -> GenericILQRSolver:
+    """Convenience constructor wiring the combined-slip bicycle
+    dynamics into GenericILQRSolver with a risk-aware cost -- the
+    solver itself is imported and used completely unmodified.
+    """
+    step_fn = lambda s, c, dt_: combined_slip_bicycle_step(s, c, tire_model, pacejka_params, vp, dt_)
+    jac_fn = lambda s, c, dt_: combined_slip_bicycle_jacobians(s, c, tire_model, pacejka_params, vp, dt_)
+    return GenericILQRSolver(
+        step_fn, jac_fn, cost, dt=dt, state_dim=STATE_DIM, control_dim=CONTROL_DIM,
+        max_iters=max_iters, max_control=max_control,
+    )
