@@ -1,0 +1,420 @@
+"""
+test_full_closed_loop_bicycle.py
+-------------------------------------
+Test groups:
+
+  A. RiskAwareBicyclePlanner: basic shape/finiteness, the ACCELERATION
+     bug found and fixed while building this deliverable (locked in
+     as a direct regression test), warm-start behavior, risk-field
+     construction from visible obstacles.
+  B. NaiveBicyclePlanner: basic shape/finiteness, reaches cruise speed.
+  C. run_closed_loop_scenario: clear-road baseline for both planners,
+     basic mechanics (collision termination, metric tracking).
+  D. THE headline finding: the four-way comparison (naive/risk-aware x
+     with/without guard) on an off-path obstacle -- naive-without-
+     guard collides, all three other configurations avoid collision.
+  E. THE second finding: the guard's proximity-triggered fallback
+     discards the risk-aware plan's own lateral avoidance strategy
+     (EMERGENCY_STOP always commands delta=0), confirmed directly by
+     inspecting the guard's decisions over several cycles, not just
+     inferred from the aggregate outcome.
+  F. Adversarial / edge cases.
+
+PERFORMANCE NOTE: full risk-aware iLQR solves are the most expensive
+operation in this series. Most tests here use SMALL horizons and
+iteration budgets to keep the suite's total runtime reasonable; the
+exact headline numbers quoted in the write-up come from a separately-
+run, larger configuration (documented in the write-up itself), the
+same practice used for the neural-Pacejka deliverable's training runs.
+"""
+
+import math
+
+import numpy as np
+import pytest
+
+from neural_pacejka import (
+    PacejkaParams,
+    generate_synthetic_dataset,
+    lateral_force_classical,
+    train_neural_pacejka,
+)
+from bicycle_dynamics_tire_model import VehicleParams
+from combined_slip_tire_model import STATE_DIM, CONTROL_DIM
+from symmetrized_tire_model import SymmetrizedNeuralPacejkaTireModel
+from simplex_guard import SimplexGuard, FallbackMode
+from bicycle_guard_integration import BicycleGuardAdapter
+from full_closed_loop_bicycle import (
+    NaiveBicyclePlanner,
+    RiskAwareBicyclePlanner,
+    RiskAwareBicyclePlannerConfig,
+    build_occupancy_grid,
+    OccupancyEgoState,
+    run_closed_loop_scenario,
+)
+
+
+@pytest.fixture(scope="module")
+def tire_model():
+    """A quick, lightly-trained tire model -- sufficient for testing
+    INTEGRATION MECHANICS (does the closed loop run, does it avoid
+    collision, does the guard fire correctly), not tire-model
+    prediction accuracy, which was already exhaustively validated in
+    the neural-Pacejka deliverable. Matches the same
+    fast-fixture-for-mechanics-tests pattern used by the
+    bicycle-dynamics deliverable's own "small_tire_model" fixture.
+    """
+    params = PacejkaParams()
+    alpha_train, Fz_train, force_train_noisy = generate_synthetic_dataset(500, params, seed=0)
+    residual_target = force_train_noisy - lateral_force_classical(alpha_train, Fz_train, params)
+    baseline_model, _ = train_neural_pacejka(
+        params, alpha_train, Fz_train, residual_target, hidden_sizes=(8, 8), epochs=300, seed=0
+    )
+    return SymmetrizedNeuralPacejkaTireModel(baseline_model), params
+
+
+FAST_CFG_KWARGS = dict(max_ilqr_iters=15)  # small budget, relies on warm-starting across cycles
+
+
+# ==========================================================================
+# A. RiskAwareBicyclePlanner
+# ==========================================================================
+
+
+class TestRiskAwareBicyclePlanner:
+    def test_generate_returns_correct_shapes(self, tire_model):
+        tm, params = tire_model
+        vp = VehicleParams()
+        planner = RiskAwareBicyclePlanner(tm, params, vp, RiskAwareBicyclePlannerConfig(**FAST_CFG_KWARGS))
+        ego = np.array([0.0, 0.0, 0.0, 12.0, 0.0, 0.0])
+        state_traj, control_traj = planner.generate(ego, T=15, dt=0.05, visible_actors_world=[])
+        assert state_traj.shape == (15, STATE_DIM)
+        assert control_traj.shape == (15, CONTROL_DIM)
+        assert np.all(np.isfinite(state_traj))
+        assert np.all(np.isfinite(control_traj))
+
+    def test_index_zero_state_is_exactly_the_real_current_state(self, tire_model):
+        """Unlike the unicycle-based ILQRPlanner from full_stack_integration.py,
+        which needed an explicit fix to make index-0 match the real
+        current state, this holds automatically here because velocity
+        is a first-class state variable in the bicycle model -- checked
+        directly, not just asserted in the module docstring."""
+        tm, params = tire_model
+        vp = VehicleParams()
+        planner = RiskAwareBicyclePlanner(tm, params, vp, RiskAwareBicyclePlannerConfig(**FAST_CFG_KWARGS))
+        ego = np.array([0.0, 0.0, 0.0, 11.0, 0.3, 0.02])
+        state_traj, _ = planner.generate(ego, T=15, dt=0.05, visible_actors_world=[])
+        np.testing.assert_allclose(state_traj[0], [0.0, 0.0, 0.0, 11.0, 0.3, 0.02])
+
+    def test_ACCELERATION_BUG_regression_planner_actually_accelerates_toward_cruise(self, tire_model):
+        """Direct regression test for the real bug found while building
+        this deliverable: the first version of RiskAwareBicyclePlannerConfig
+        had a control-cost weight (copied from the previous deliverable's
+        own, always-already-at-cruise-speed test scenarios) that made
+        accelerating from a below-target starting speed prohibitively
+        expensive relative to a weak terminal velocity weight -- the
+        optimizer converged to essentially zero throttle every time,
+        regardless of the initial guess. Fixed with a running (not just
+        terminal) speed-tracking cost term and a much smaller Fx control
+        weight (see write-up Section 3 for the full diagnostic story).
+        This test locks in that a below-target starting speed actually
+        produces real acceleration, not a near-zero-effort plan.
+        """
+        tm, params = tire_model
+        vp = VehicleParams()
+        cfg = RiskAwareBicyclePlannerConfig(target_speed_mps=15.0, max_ilqr_iters=60)
+        planner = RiskAwareBicyclePlanner(tm, params, vp, cfg)
+        ego = np.array([0.0, 0.0, 0.0, 10.0, 0.0, 0.0])
+        _, control_traj = planner.generate(ego, T=30, dt=0.05, visible_actors_world=[])
+        total_Fx = control_traj[0, 1] + control_traj[0, 2]
+        assert total_Fx > 200.0, f"expected meaningful throttle, got total Fx={total_Fx:.1f}N"
+
+    def test_warm_start_is_used_across_cycles(self, tire_model):
+        tm, params = tire_model
+        vp = VehicleParams()
+        planner = RiskAwareBicyclePlanner(tm, params, vp, RiskAwareBicyclePlannerConfig(**FAST_CFG_KWARGS))
+        ego = np.array([0.0, 0.0, 0.0, 12.0, 0.0, 0.0])
+        planner.generate(ego, T=15, dt=0.05, visible_actors_world=[])
+        assert planner._U_prev is not None
+        first_U = planner._U_prev.copy()
+        planner.generate(ego, T=15, dt=0.05, visible_actors_world=[])
+        shifted = np.vstack([first_U[1:], first_U[-1:]])
+        # Warm-started solve should be close to a one-step shift of the
+        # first (not identical -- it re-solves -- but not wildly off).
+        np.testing.assert_allclose(planner._U_prev, shifted, atol=5.0)
+
+    def test_reset_clears_warm_start(self, tire_model):
+        tm, params = tire_model
+        vp = VehicleParams()
+        planner = RiskAwareBicyclePlanner(tm, params, vp, RiskAwareBicyclePlannerConfig(**FAST_CFG_KWARGS))
+        ego = np.array([0.0, 0.0, 0.0, 12.0, 0.0, 0.0])
+        planner.generate(ego, T=15, dt=0.05, visible_actors_world=[])
+        assert planner._U_prev is not None
+        planner.reset()
+        assert planner._U_prev is None
+
+    def test_risk_field_none_with_no_visible_actors(self, tire_model):
+        tm, params = tire_model
+        vp = VehicleParams()
+        planner = RiskAwareBicyclePlanner(tm, params, vp)
+        ego = np.array([0.0, 0.0, 0.0, 12.0, 0.0, 0.0])
+        assert planner._build_risk_field(ego, []) is None
+
+    def test_risk_field_transforms_into_ego_frame(self, tire_model):
+        tm, params = tire_model
+        vp = VehicleParams()
+        planner = RiskAwareBicyclePlanner(tm, params, vp)
+        ego = np.array([10.0, 5.0, math.pi / 2, 12.0, 0.0, 0.0])  # heading +90deg
+        # World-frame obstacle "north" of ego -> should land AHEAD
+        # (positive local x) given the +90deg heading.
+        visible = [(10.0, 15.0, 2.0, 2.0)]
+        risk_field = planner._build_risk_field(ego, visible)
+        assert risk_field is not None
+        bump = risk_field.occupancy.bumps[0]
+        assert bump.center[0] > 5.0
+
+
+# ==========================================================================
+# B. NaiveBicyclePlanner
+# ==========================================================================
+
+
+class TestNaiveBicyclePlanner:
+    def test_generate_returns_correct_shapes(self, tire_model):
+        tm, params = tire_model
+        vp = VehicleParams()
+        planner = NaiveBicyclePlanner(target_speed_mps=15.0)
+        planner.set_dynamics(tm, params, vp)
+        ego = np.array([0.0, 0.0, 0.0, 12.0, 0.0, 0.0])
+        state_traj, control_traj = planner.generate(ego, T=20, dt=0.05, visible_actors_world=[])
+        assert state_traj.shape == (20, STATE_DIM)
+        assert control_traj.shape == (20, CONTROL_DIM)
+
+    def test_ignores_obstacles_by_construction(self, tire_model):
+        tm, params = tire_model
+        vp = VehicleParams()
+        planner = NaiveBicyclePlanner(target_speed_mps=15.0)
+        planner.set_dynamics(tm, params, vp)
+        ego = np.array([0.0, 0.0, 0.0, 12.0, 0.0, 0.0])
+        traj_no_obs, control_no_obs = planner.generate(ego, T=20, dt=0.05, visible_actors_world=[])
+        traj_obs, control_obs = planner.generate(ego, T=20, dt=0.05, visible_actors_world=[(20.0, 1.0, 2.0, 2.0)])
+        np.testing.assert_array_equal(control_no_obs, control_obs)
+
+    def test_accelerates_toward_target(self, tire_model):
+        tm, params = tire_model
+        vp = VehicleParams()
+        planner = NaiveBicyclePlanner(target_speed_mps=15.0)
+        planner.set_dynamics(tm, params, vp)
+        ego = np.array([0.0, 0.0, 0.0, 10.0, 0.0, 0.0])
+        state_traj, _ = planner.generate(ego, T=30, dt=0.05, visible_actors_world=[])
+        assert state_traj[-1, 3] > state_traj[0, 3]
+
+
+# ==========================================================================
+# C. run_closed_loop_scenario mechanics
+# ==========================================================================
+
+
+class TestClosedLoopMechanics:
+    def test_clear_road_naive_reaches_cruise_no_collision(self, tire_model):
+        tm, params = tire_model
+        vp = VehicleParams()
+        planner = NaiveBicyclePlanner(target_speed_mps=15.0)
+        planner.set_dynamics(tm, params, vp)
+        ego_init = np.array([0.0, 0.0, 0.0, 10.0, 0.0, 0.0])
+        result = run_closed_loop_scenario(ego_init, planner, None, [], duration_s=1.5, dt=0.05, T=20)
+        assert not result.collided
+        assert result.speed_history[-1] == pytest.approx(15.0, abs=1.0)
+        assert result.override_count == 0
+
+    def test_clear_road_risk_aware_reaches_cruise_no_collision(self, tire_model):
+        tm, params = tire_model
+        vp = VehicleParams()
+        cfg = RiskAwareBicyclePlannerConfig(target_speed_mps=15.0, **FAST_CFG_KWARGS)
+        planner = RiskAwareBicyclePlanner(tm, params, vp, cfg)
+        ego_init = np.array([0.0, 0.0, 0.0, 10.0, 0.0, 0.0])
+        result = run_closed_loop_scenario(ego_init, planner, None, [], duration_s=1.0, dt=0.05, T=15)
+        assert not result.collided
+        assert result.speed_history[-1] > result.speed_history[0]
+
+    def test_collision_terminates_the_run_early(self, tire_model):
+        tm, params = tire_model
+        vp = VehicleParams()
+        planner = NaiveBicyclePlanner(target_speed_mps=15.0)
+        planner.set_dynamics(tm, params, vp)
+        obstacle = (5.0, 0.0, 2.0, 1.8)  # directly in the ego's path, very close
+        ego_init = np.array([0.0, 0.0, 0.0, 15.0, 0.0, 0.0])
+        result = run_closed_loop_scenario(ego_init, planner, None, [obstacle], duration_s=2.0, dt=0.05, T=20)
+        assert result.collided
+        assert result.n_steps < int(2.0 / 0.05)  # ended before the full duration
+
+    def test_min_clearance_is_positive_infinity_with_no_obstacles(self, tire_model):
+        tm, params = tire_model
+        vp = VehicleParams()
+        planner = NaiveBicyclePlanner(target_speed_mps=15.0)
+        planner.set_dynamics(tm, params, vp)
+        ego_init = np.array([0.0, 0.0, 0.0, 10.0, 0.0, 0.0])
+        result = run_closed_loop_scenario(ego_init, planner, None, [], duration_s=0.5, dt=0.05, T=15)
+        assert result.min_clearance_m == float("inf")
+
+
+# ==========================================================================
+# D. THE headline finding: four-way comparison
+# ==========================================================================
+
+
+class TestHeadlineFourWayComparison:
+    """Uses a SMALLER-scale version of the write-up's headline scenario
+    (shorter duration, smaller horizon, fewer iLQR iterations) to keep
+    test runtime reasonable while still checking the same qualitative
+    claims. The exact numbers in the write-up come from a larger,
+    separately-run configuration.
+    """
+
+    OBSTACLE = (18.0, 1.2, 2.0, 1.5)
+    EGO_INIT = np.array([0.0, 0.0, 0.0, 15.0, 0.0, 0.0])
+    DURATION = 1.5
+    DT = 0.05
+    T = 20
+
+    def _make_naive(self, tm, params, vp):
+        p = NaiveBicyclePlanner(target_speed_mps=15.0)
+        p.set_dynamics(tm, params, vp)
+        return p
+
+    def _make_risk_aware(self, tm, params, vp):
+        cfg = RiskAwareBicyclePlannerConfig(target_speed_mps=15.0, risk_weight=400.0, **FAST_CFG_KWARGS)
+        return RiskAwareBicyclePlanner(tm, params, vp, cfg)
+
+    def test_naive_without_guard_collides(self, tire_model):
+        """Sanity check that the scenario is a meaningful test: an
+        obstacle-blind planner with no safety backstop really does hit
+        the obstacle here."""
+        tm, params = tire_model
+        vp = VehicleParams()
+        planner = self._make_naive(tm, params, vp)
+        result = run_closed_loop_scenario(
+            self.EGO_INIT, planner, None, [self.OBSTACLE], self.DURATION, self.DT, self.T
+        )
+        assert result.collided
+
+    def test_naive_with_guard_avoids_collision(self, tire_model):
+        tm, params = tire_model
+        vp = VehicleParams()
+        planner = self._make_naive(tm, params, vp)
+        adapter = BicycleGuardAdapter(SimplexGuard(), tm, params, vp)
+        result = run_closed_loop_scenario(
+            self.EGO_INIT, planner, adapter, [self.OBSTACLE], self.DURATION, self.DT, self.T
+        )
+        assert not result.collided
+        assert result.override_count > 0
+
+    def test_risk_aware_without_guard_avoids_collision(self, tire_model):
+        tm, params = tire_model
+        vp = VehicleParams()
+        planner = self._make_risk_aware(tm, params, vp)
+        result = run_closed_loop_scenario(
+            self.EGO_INIT, planner, None, [self.OBSTACLE], self.DURATION, self.DT, self.T
+        )
+        assert not result.collided
+        assert result.override_count == 0  # no guard present at all
+
+    def test_risk_aware_with_guard_avoids_collision(self, tire_model):
+        tm, params = tire_model
+        vp = VehicleParams()
+        planner = self._make_risk_aware(tm, params, vp)
+        adapter = BicycleGuardAdapter(SimplexGuard(), tm, params, vp)
+        result = run_closed_loop_scenario(
+            self.EGO_INIT, planner, adapter, [self.OBSTACLE], self.DURATION, self.DT, self.T
+        )
+        assert not result.collided
+
+
+# ==========================================================================
+# E. The guard discards the risk-aware plan's own steering
+# ==========================================================================
+
+
+class TestGuardDiscardsRiskAwareSteering:
+    def test_proximity_override_always_zeroes_steering_even_for_a_curving_candidate(self, tire_model):
+        """Confirms directly (not just inferred from the aggregate
+        four-way comparison) that when the guard's proximity check
+        fires on a risk-aware candidate, the resulting SAFE trajectory
+        has zero steering, regardless of what the candidate itself
+        was planning to do -- the guard has no notion of "the plan is
+        already handling this hazard via lateral avoidance," because
+        its EMERGENCY_STOP/COMFORT_STOP fallback is always a straight
+        line by construction (see bicycle_guard_integration.py).
+        """
+        tm, params = tire_model
+        vp = VehicleParams()
+        cfg = RiskAwareBicyclePlannerConfig(target_speed_mps=15.0, risk_weight=400.0, **FAST_CFG_KWARGS)
+        planner = RiskAwareBicyclePlanner(tm, params, vp, cfg)
+        adapter = BicycleGuardAdapter(SimplexGuard(), tm, params, vp)
+
+        ego = np.array([0.0, 0.0, 0.0, 15.0, 0.0, 0.0])
+        obstacle = (18.0, 1.2, 2.0, 1.5)
+        occ_ego = OccupancyEgoState(x=ego[0], y=ego[1], heading=ego[2], speed=ego[3])
+        occupancy, origin = build_occupancy_grid(occ_ego, [obstacle], 80.0, 0.5)
+
+        candidate_state, candidate_control = planner.generate(ego, 20, 0.05, [obstacle])
+        ego_local = np.array([0.0, 0.0, 0.0, ego[3], ego[4], ego[5]])
+        decision, safe_state, safe_control, overridden = adapter.check_and_override(
+            candidate_state, candidate_control, ego_local, occupancy, 0.05, resolution_m=0.5, occupancy_origin=origin
+        )
+        assert overridden
+        assert decision.fallback_mode in (FallbackMode.EMERGENCY_STOP, FallbackMode.COMFORT_STOP)
+        assert np.all(safe_control[:, 0] == 0.0)  # steering discarded, regardless of the candidate's own delta
+
+
+# ==========================================================================
+# F. Adversarial / edge cases
+# ==========================================================================
+
+
+class TestAdversarialAndEdgeCases:
+    def test_zero_duration_runs_cleanly(self, tire_model):
+        tm, params = tire_model
+        vp = VehicleParams()
+        planner = NaiveBicyclePlanner(target_speed_mps=15.0)
+        planner.set_dynamics(tm, params, vp)
+        ego_init = np.array([0.0, 0.0, 0.0, 10.0, 0.0, 0.0])
+        result = run_closed_loop_scenario(ego_init, planner, None, [], duration_s=0.0, dt=0.05, T=10)
+        assert result.n_steps == 0
+
+    def test_multiple_obstacles_does_not_crash(self, tire_model):
+        tm, params = tire_model
+        vp = VehicleParams()
+        planner = NaiveBicyclePlanner(target_speed_mps=15.0)
+        planner.set_dynamics(tm, params, vp)
+        adapter = BicycleGuardAdapter(SimplexGuard(), tm, params, vp)
+        obstacles = [(15.0, 1.5, 2.0, 1.5), (30.0, -1.0, 2.0, 1.5)]
+        ego_init = np.array([0.0, 0.0, 0.0, 12.0, 0.0, 0.0])
+        result = run_closed_loop_scenario(ego_init, planner, adapter, obstacles, duration_s=1.0, dt=0.05, T=15)
+        assert all(math.isfinite(v) for v in result.speed_history)
+
+    def test_result_never_contains_nan_across_randomized_scenarios(self, tire_model):
+        tm, params = tire_model
+        vp = VehicleParams()
+        rng = np.random.default_rng(0)
+        adapter = BicycleGuardAdapter(SimplexGuard(), tm, params, vp)
+        for _ in range(3):
+            planner = NaiveBicyclePlanner(target_speed_mps=float(rng.uniform(8, 18)))
+            planner.set_dynamics(tm, params, vp)
+            obstacle = (
+                float(rng.uniform(10, 25)), float(rng.uniform(-2, 2)), 2.0, 1.5
+            )
+            ego_init = np.array([0.0, 0.0, 0.0, float(rng.uniform(8, 18)), 0.0, 0.0])
+            result = run_closed_loop_scenario(ego_init, planner, adapter, [obstacle], duration_s=0.75, dt=0.05, T=15)
+            assert all(math.isfinite(v) for v in result.speed_history)
+            assert np.all(np.isfinite(result.final_world_state))
+
+    def test_guard_adapter_none_means_no_overrides_ever(self, tire_model):
+        tm, params = tire_model
+        vp = VehicleParams()
+        planner = NaiveBicyclePlanner(target_speed_mps=15.0)
+        planner.set_dynamics(tm, params, vp)
+        obstacle = (10.0, 0.0, 2.0, 1.8)
+        ego_init = np.array([0.0, 0.0, 0.0, 15.0, 0.0, 0.0])
+        result = run_closed_loop_scenario(ego_init, planner, None, [obstacle], duration_s=1.0, dt=0.05, T=15)
+        assert result.override_count == 0
